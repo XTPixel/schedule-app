@@ -3,6 +3,7 @@
 
 mod commands;
 mod state;
+pub mod platform;
 
 use std::collections::HashSet;
 use std::fs;
@@ -49,7 +50,8 @@ pub fn run() {
                 config_generation: AtomicU64::new(0),
             });
             build_tray(app.handle(), config.notifications.enabled)?;
-            register_hotkey(app.handle());
+            // 应用启动时同步全局快捷键与开机自启动状态（§1.0.1）。
+            apply_behavior_settings(app.handle());
             // 启动/主窗口打开时被动刷新提醒（§6.3）。
             check_and_notify(app.handle());
             // V3.0 F5：启动后台周期调度线程，常驻/最小化时到点也能弹系统通知。
@@ -156,6 +158,20 @@ pub(crate) fn register_hotkey(app: &tauri::AppHandle) {
     });
 }
 
+/// 按当前配置应用全局快捷键与开机自启动（启动时 + 配置变更时统一入口）。
+fn apply_behavior_settings(app: &tauri::AppHandle) {
+    register_hotkey(app);
+    let autostart = app
+        .state::<AppState>()
+        .config
+        .lock()
+        .map(|c| c.behavior.launch_at_startup)
+        .unwrap_or(false);
+    if let Err(e) = platform::set_autostart(autostart) {
+        eprintln!("[autostart] {e}");
+    }
+}
+
 /// 构建托盘图标与菜单（§4.7：最小化、菜单、通知开关、退出）。
 fn build_tray(app: &tauri::AppHandle, notify_enabled: bool) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "打开主界面", true, None::<&str>)?;
@@ -199,6 +215,7 @@ fn build_tray(app: &tauri::AppHandle, notify_enabled: bool) -> tauri::Result<()>
 
 fn show_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window(WINDOW_LABEL) {
+        let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
     }
@@ -226,7 +243,7 @@ fn toggle_notify(app: &tauri::AppHandle) {
 }
 
 /// V3.1 T4：单一配置应用线程。`set_config` 只落盘并递增 generation；
-/// 本线程串行读取最新配置并应用全局快捷键，快速连续保存只按最终状态执行。
+/// 本线程串行读取最新配置并应用全局快捷键与开机自启动，快速连续保存只按最终状态执行。
 fn start_config_applier(app: &tauri::AppHandle) {
     let handle = app.clone();
     thread::spawn(move || {
@@ -239,7 +256,7 @@ fn start_config_applier(app: &tauri::AppHandle) {
                 continue;
             }
             applied = generation;
-            register_hotkey(&handle);
+            apply_behavior_settings(&handle);
         }
     });
 }

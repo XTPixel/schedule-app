@@ -282,6 +282,12 @@ export function SettingsPage() {
             onChange={(v) => save({ ...config, behavior: { ...config.behavior, minimizeToTray: v } })}
           />
         </Row>
+        <Row label="开机自启动" hint="登录 Windows 后自动运行本应用">
+          <Toggle
+            checked={config.behavior.launchAtStartup}
+            onChange={(v) => save({ ...config, behavior: { ...config.behavior, launchAtStartup: v } })}
+          />
+        </Row>
         <Row label="全局快捷键" hint="唤起主窗口（如 Ctrl+Shift+A，失焦保存）">
           <input
             className="rounded-lg border border-gray-200 dark:border-slate-600 bg-white dark:bg-slate-800 px-2 py-1.5 text-sm text-gray-800 dark:text-slate-100 outline-none focus:border-accent-400"
