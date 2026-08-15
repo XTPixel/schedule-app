@@ -1,0 +1,22 @@
+[package]
+name = "schedule-app"
+version = "1.0.0"
+description = "此刻 MOMENT —— 个人日程管理（1.0.0：本地优先的桌面日程应用）"
+edition = "2021"
+
+[lib]
+name = "schedule_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-dialog = "2"
+schedule-core = { path = "core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"

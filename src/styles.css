@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: #f6f7f9;
+  color: #1f2937;
+  -webkit-font-smoothing: antialiased;
+}
+
+.dark body {
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+/* 行内编辑输入框通用样式 */
+.inline-input {
+  @apply w-full rounded-md border border-transparent bg-transparent px-1 py-0.5 text-sm outline-none transition;
+}
+.inline-input:hover {
+  @apply border-gray-200 bg-white;
+}
+.inline-input:focus {
+  @apply border-accent-400 bg-white ring-2 ring-accent-100;
+}
+.dark .inline-input:hover,
+.dark .inline-input:focus {
+  background-color: #1e293b;
+  border-color: #475569;
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #d1d5db;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #9ca3af;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #475569;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
