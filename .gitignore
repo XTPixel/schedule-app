@@ -6,3 +6,4 @@ src-tauri/core/target/
 .rustup/
 .cargo/
 .tools/*.exe
+docs/
