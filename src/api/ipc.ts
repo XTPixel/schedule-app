@@ -58,6 +58,8 @@ export interface AddLongTaskSessionInput {
   endedAt: string;
   durationMs: number;
   note?: string | null;
+  /** V1.2.1：前端生成的幂等键。 */
+  sessionId: string;
 }
 
 export const addLongTaskSession = (input: AddLongTaskSessionInput) =>

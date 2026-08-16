@@ -1,6 +1,6 @@
 [package]
 name = "schedule-core"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 description = "此刻 MOMENT - 核心业务逻辑（数据模型/存储/候选推荐引擎），不依赖 Tauri"
 

@@ -278,7 +278,7 @@ export function Drawer() {
         </Field>
 
         {kind === "event" && <EventFields draft={draft as Event} tz={tz} updateDraft={updateDraft} />}
-        {kind === "routine" && <RoutineFields draft={draft as Routine} updateDraft={updateDraft} />}
+        {kind === "routine" && <RoutineFields draft={draft as Routine} tz={tz} updateDraft={updateDraft} />}
         {kind === "task" && <TaskFields draft={draft as Task} tz={tz} updateDraft={updateDraft} />}
         {kind === "longtask" && <LongTaskFields draft={draft as LongTask} updateDraft={updateDraft} />}
 
@@ -431,9 +431,11 @@ function EventFields({
 
 function RoutineFields({
   draft,
+  tz,
   updateDraft,
 }: {
   draft: Routine;
+  tz: string;
   updateDraft: (p: never) => void;
 }) {
   function updateWindow(i: number, patch: Partial<TimeWindow>) {
@@ -445,8 +447,15 @@ function RoutineFields({
   }
   function addWindow() {
     updateDraft({
-      timeWindows: [...draft.timeWindows, { daysOfWeek: [], start: "08:00", end: "09:00" }],
+      timeWindows: [
+        ...draft.timeWindows,
+        { daysOfWeek: [], start: "08:00", end: "09:00", everyDays: null, anchorDate: null },
+      ],
     } as never);
+  }
+  /** V1.2.1：窗口模式切换（按星期 ↔ 每隔 N 天）。 */
+  function setWindowMode(i: number, every: boolean) {
+    updateWindow(i, every ? { everyDays: 1, anchorDate: todayInTz(tz), daysOfWeek: [] } : { everyDays: null, anchorDate: null });
   }
 
   return (
@@ -454,12 +463,52 @@ function RoutineFields({
       <Field label="时间窗口">
         {draft.timeWindows.map((w, i) => (
           <div key={i} className="mb-3 rounded-lg border border-gray-100 dark:border-slate-700 p-3">
-            <WeekdayPicker
-              days={w.daysOfWeek}
-              onSave={(daysOfWeek) => {
-                updateWindow(i, { daysOfWeek });
-              }}
-            />
+            <div className="mb-2 flex gap-1">
+              <button
+                type="button"
+                className={`rounded-md px-2 py-1 text-xs ${w.everyDays == null ? "bg-accent-500 text-white" : "bg-gray-100 dark:bg-slate-700 text-gray-500 dark:text-slate-400"}`}
+                onClick={() => setWindowMode(i, false)}
+              >
+                按星期
+              </button>
+              <button
+                type="button"
+                className={`rounded-md px-2 py-1 text-xs ${w.everyDays != null ? "bg-accent-500 text-white" : "bg-gray-100 dark:bg-slate-700 text-gray-500 dark:text-slate-400"}`}
+                onClick={() => setWindowMode(i, true)}
+              >
+                每隔 N 天
+              </button>
+            </div>
+
+            {w.everyDays == null ? (
+              <WeekdayPicker
+                days={w.daysOfWeek}
+                onSave={(daysOfWeek) => {
+                  updateWindow(i, { daysOfWeek });
+                }}
+              />
+            ) : (
+              <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-gray-500 dark:text-slate-400">
+                <span>从</span>
+                <input
+                  type="date"
+                  className="rounded-md border border-gray-200 dark:border-slate-600 bg-white dark:bg-slate-800 px-1.5 py-1 text-xs text-gray-700 dark:text-slate-200"
+                  value={w.anchorDate ?? ""}
+                  onChange={(e) => updateWindow(i, { anchorDate: e.target.value || null })}
+                />
+                <span>起，每隔</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={365}
+                  className="w-20 rounded-md border border-gray-200 dark:border-slate-600 bg-white dark:bg-slate-800 px-1.5 py-1 text-xs text-gray-700 dark:text-slate-200"
+                  value={w.everyDays ?? 1}
+                  onChange={(e) => updateWindow(i, { everyDays: Math.min(365, Math.max(1, Number(e.target.value) || 1)) })}
+                />
+                <span>天一次</span>
+              </div>
+            )}
+
             <div className="mt-2 flex items-center gap-2">
               <TimeField value={w.start} onChange={(t) => updateWindow(i, { start: t })} />
               <span className="text-gray-400 dark:text-slate-500">–</span>

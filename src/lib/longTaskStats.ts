@@ -32,7 +32,8 @@ export function computeLongTaskStats(task: LongTask, today: string, tz: string):
 
   for (const s of sessions) {
     totalDurationMs += Math.max(0, s.durationMs);
-    const d = dayjs(s.startedAt).tz(tz).format("YYYY-MM-DD");
+    // V1.2.1：会话按 endedAt 本地日期归属（与归档 / 统计口径一致）。
+    const d = dayjs(s.endedAt).tz(tz).format("YYYY-MM-DD");
     if (d === today) {
       todayCount += 1;
       todayDurationMs += Math.max(0, s.durationMs);

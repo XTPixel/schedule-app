@@ -85,6 +85,8 @@ fn build_routine(item: &TemplateItem, date: NaiveDate) -> Routine {
         days_of_week,
         start: item.window_start.clone().unwrap_or_else(|| "08:00".to_string()),
         end: item.window_end.clone().unwrap_or_else(|| "09:00".to_string()),
+        every_days: None,
+        anchor_date: None,
     };
     rt.time_windows = vec![window];
     rt

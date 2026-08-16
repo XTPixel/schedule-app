@@ -6,14 +6,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{Datelike, Duration};
+use chrono::Duration;
 use schedule_core::{
     apply_template, compute_candidates, compute_review, compute_stats, dispatch_hook, expand_events,
-    list_hooks, new_template, new_template_item, parse_natural_language, preview_template, timeutil,
-    ArchiveDay, ArchiveEntry, ArchiveFile, ArchiveSource, AppData, CalendarData, CalendarRoutineWindow,
-    CandidatesResult, Config, Event, HookInfo, HookRunResult, ItemStatus, LongTask, LongTaskSession,
-    LongTaskStatus, NlpEvent, ReviewResult, Routine, SearchQuery, SearchResult, StatsResult, Storage,
-    Task, Template, TemplateApplyResult, TemplateKind, TemplatePreview,
+    list_hooks, new_template, new_template_item, parse_natural_language, preview_template,
+    time_window_matches_date, timeutil, ArchiveDay, ArchiveEntry, ArchiveFile, ArchiveSource, AppData,
+    CalendarData, CalendarRoutineWindow, CandidatesResult, Config, Event, HookInfo, HookRunResult,
+    ItemStatus, LongTask, LongTaskSession, LongTaskStatus, NlpEvent, ReviewResult, Routine, SearchQuery,
+    SearchResult, StatsResult, Storage, Task, Template, TemplateApplyResult, TemplateKind, TemplatePreview,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -54,11 +54,15 @@ fn month_of(date: &str) -> String {
 // 加载
 // ---------------------------------------------------------------------------
 
-/// `load_all_data()`：加载并校验全部 JSON。
+/// `load_all_data()`：加载并校验全部 JSON；随后幂等回填长期任务归档聚合条目。
 #[tauri::command]
 pub fn load_all_data(state: State<AppState>) -> Result<AppData, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-    let data = storage.load_all().map_err(|e| e.to_string())?;
+    let mut data = storage.load_all().map_err(|e| e.to_string())?;
+    // V1.2.1：升级前历史会话 / 归档缺漏回填（只补齐缺失，不覆盖已有条目）。
+    backfill_long_task_archives(&mut storage, &data).map_err(|e| format!("长期任务归档对账失败：{e}"))?;
+    // 回填可能修改当前月份归档：重新加载一次，保证返回的 archive 与磁盘一致。
+    data = storage.load_all().map_err(|e| e.to_string())?;
     if let Ok(mut cfg) = state.config.lock() {
         *cfg = data.config.clone();
     }
@@ -126,11 +130,55 @@ pub fn delete_event(id: String, state: State<AppState>) -> Result<(), String> {
 // 日常 CRUD（软删除）
 // ---------------------------------------------------------------------------
 
+/// V1.2.1：日常窗口校验（模式互斥 / N 范围 / 锚点合法 / 时间区间）。
+fn validate_routine(r: &Routine) -> Result<(), String> {
+    for w in &r.time_windows {
+        let (Ok(start), Ok(end)) = (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end)) else {
+            return Err(format!("时间窗口「{}–{}」格式无效", w.start, w.end));
+        };
+        if end <= start {
+            return Err(format!("时间窗口「{}–{}」结束必须晚于开始", w.start, w.end));
+        }
+        match w.every_days {
+            Some(n) => {
+                if !(1..=365).contains(&n) {
+                    return Err("每隔 N 天的 N 必须在 1–365 之间".to_string());
+                }
+                let Some(anchor) = w.anchor_date.as_deref() else {
+                    return Err("每隔 N 天模式必须填写锚点日期".to_string());
+                };
+                if timeutil::parse_date(anchor).is_err() {
+                    return Err(format!("锚点日期无效：{anchor}"));
+                }
+            }
+            None => {
+                if w.anchor_date.is_some() {
+                    return Err("按星期模式不应有锚点日期".to_string());
+                }
+                if w.days_of_week.iter().any(|d| !(1..=7).contains(d)) {
+                    return Err("星期取值必须在 1–7 之间".to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn save_routine(routine: Routine, state: State<AppState>) -> Result<Routine, String> {
+    let mut r = routine;
+    // 保存时清理互斥字段，避免歧义；再统一校验。
+    for w in r.time_windows.iter_mut() {
+        if w.every_days.is_some() {
+            w.days_of_week.clear();
+        } else {
+            w.anchor_date = None;
+        }
+    }
+    validate_routine(&r)?;
+
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let mut routines = storage.read_routines().map_err(|e| e.to_string())?;
-    let mut r = routine;
     if r.id.is_empty() {
         r.id = schedule_core::id::new_id("r");
     }
@@ -268,6 +316,142 @@ pub fn delete_long_task(id: String, state: State<AppState>) -> Result<(), String
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// V1.2.1：长期任务会话 ↔ 归档聚合同步
+// ---------------------------------------------------------------------------
+
+/// 会话归属日期 = `endedAt` 的本地日期（与归档 doneAt 口径一致，V1.2.1 修订 D7）。
+fn long_task_session_date(s: &LongTaskSession, tz: &str) -> Result<String, String> {
+    let ended = timeutil::parse_utc(&s.ended_at).map_err(|e| e.to_string())?;
+    Ok(timeutil::fmt_local_date(&ended, tz))
+}
+
+/// 按 §3.2 规则构建某天某长期任务的聚合归档条目；无有效会话返回 None。
+fn build_long_task_archive_entry(
+    task: &LongTask,
+    sessions: &[&LongTaskSession],
+    tz: &str,
+    existing_id: Option<String>,
+) -> Result<Option<ArchiveEntry>, String> {
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+    // time / doneAt：当天首次有效会话的结束时刻。
+    let mut by_end: Vec<&LongTaskSession> = sessions.to_vec();
+    by_end.sort_by(|a, b| a.ended_at.cmp(&b.ended_at));
+    let first = by_end[0];
+    let done_utc = timeutil::parse_utc(&first.ended_at).map_err(|e| e.to_string())?;
+    let time = timeutil::fmt_local_time(&done_utc, tz);
+
+    // note：按会话开始时间升序，每行 `HH:mm 收获`；无收获的会话不占行。
+    let mut noted: Vec<&LongTaskSession> = sessions
+        .iter()
+        .copied()
+        .filter(|s| s.note.as_deref().map(|n| !n.trim().is_empty()).unwrap_or(false))
+        .collect();
+    noted.sort_by(|a, b| a.started_at.cmp(&b.started_at));
+    let note_lines: Vec<String> = noted
+        .iter()
+        .filter_map(|s| {
+            let started = timeutil::parse_utc(&s.started_at).ok()?;
+            let hm = timeutil::fmt_local_time(&started, tz);
+            Some(format!("{hm} {}", s.note.as_deref().unwrap_or_default().trim()))
+        })
+        .collect();
+    let note = if note_lines.is_empty() { None } else { Some(note_lines.join("\n")) };
+
+    let total_ms: i64 = sessions.iter().map(|s| s.duration_ms.max(0)).sum();
+    let duration_minutes = (((total_ms as f64) / 60_000.0).round() as i64).max(1);
+
+    Ok(Some(ArchiveEntry {
+        id: existing_id.unwrap_or_else(|| schedule_core::id::new_id("a")),
+        time,
+        title: task.title.clone(),
+        source: ArchiveSource::LongTask,
+        source_id: Some(task.id.clone()),
+        note,
+        duration_minutes: Some(duration_minutes),
+        done_at: first.ended_at.clone(),
+    }))
+}
+
+/// 重建式聚合：删除该任务在某天的既有 longtask 条目，再按剩余有效会话重建。
+fn sync_long_task_archive_day(storage: &mut Storage, task: &LongTask, date: &str) -> Result<(), String> {
+    let tz = storage.read_config().map_err(|e| e.to_string())?.timezone.clone();
+    let month = month_of(date);
+    let mut archive = storage.load_archive_month(&month).map_err(|e| e.to_string())?;
+    let day = archive.days.entry(date.to_string()).or_insert_with(|| ArchiveDay {
+        entries: vec![],
+        summary: None,
+        updated_at: timeutil::now_utc_string(),
+    });
+
+    let existing_id = day
+        .entries
+        .iter()
+        .find(|e| e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str()))
+        .map(|e| e.id.clone());
+    day.entries
+        .retain(|e| !(e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str())));
+
+    let sessions: Vec<&LongTaskSession> = task
+        .sessions
+        .iter()
+        .filter(|s| s.deleted_at.is_none())
+        .filter(|s| long_task_session_date(s, &tz).ok().as_deref() == Some(date))
+        .collect();
+
+    if let Some(entry) = build_long_task_archive_entry(task, &sessions, &tz, existing_id)? {
+        day.entries.push(entry);
+    }
+    day.entries.sort_by(|a, b| a.done_at.cmp(&b.done_at));
+    day.updated_at = timeutil::now_utc_string();
+    storage.save_archive_month(&archive).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 启动 / 加载时幂等回填：只补齐缺失的 longtask 聚合条目，不覆盖已存在条目。
+fn backfill_long_task_archives(storage: &mut Storage, data: &AppData) -> Result<usize, String> {
+    let tz = &data.config.timezone;
+    // (task index, task id, date) -> 该天全部有效会话。
+    let mut grouped: BTreeMap<(usize, String, String), Vec<&LongTaskSession>> = BTreeMap::new();
+    for (idx, task) in data.long_tasks.iter().enumerate() {
+        for s in &task.sessions {
+            if s.deleted_at.is_some() {
+                continue;
+            }
+            let Ok(date) = long_task_session_date(s, tz) else { continue };
+            grouped.entry((idx, task.id.clone(), date)).or_default().push(s);
+        }
+    }
+
+    let mut created = 0usize;
+    for ((idx, _task_id, date), sessions) in grouped {
+        let task = &data.long_tasks[idx];
+        let month = month_of(&date);
+        let mut archive = storage.load_archive_month(&month).map_err(|e| e.to_string())?;
+        let day = archive.days.entry(date.clone()).or_insert_with(|| ArchiveDay {
+            entries: vec![],
+            summary: None,
+            updated_at: timeutil::now_utc_string(),
+        });
+        let missing = !day
+            .entries
+            .iter()
+            .any(|e| e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str()));
+        if missing {
+            if let Some(entry) = build_long_task_archive_entry(task, &sessions, tz, None)? {
+                day.entries.push(entry);
+                day.entries.sort_by(|a, b| a.done_at.cmp(&b.done_at));
+                day.updated_at = timeutil::now_utc_string();
+                storage.save_archive_month(&archive).map_err(|e| e.to_string())?;
+                created += 1;
+            }
+        }
+    }
+    Ok(created)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddLongTaskSessionInput {
@@ -278,16 +462,29 @@ pub struct AddLongTaskSessionInput {
     pub duration_ms: i64,
     #[serde(default)]
     pub note: Option<String>,
+    /// V1.2.1：前端生成的幂等键；重试 / 补偿时不会重复写入会话。
+    pub session_id: String,
 }
 
 #[tauri::command]
 pub fn add_long_task_session(input: AddLongTaskSessionInput, state: State<AppState>) -> Result<LongTaskSession, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let config = storage.read_config().map_err(|e| e.to_string())?;
+    let tz = config.timezone.clone();
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
-    let task = tasks
-        .iter_mut()
-        .find(|t| t.id == input.task_id && t.deleted_at.is_none())
+    let idx = tasks
+        .iter()
+        .position(|t| t.id == input.task_id && t.deleted_at.is_none())
         .ok_or_else(|| "长期任务不存在或已删除".to_string())?;
+
+    // 幂等：同 sessionId（含软删除）已存在时直接返回，并补偿归档对账。
+    if let Some(existing) = tasks[idx].sessions.iter().find(|s| s.id == input.session_id) {
+        let out = existing.clone();
+        let date = long_task_session_date(existing, &tz)?;
+        let task = tasks[idx].clone();
+        sync_long_task_archive_day(&mut storage, &task, &date)?;
+        return Ok(out);
+    }
 
     let started = timeutil::normalize_to_utc(&input.started_at).map_err(|e| e.to_string())?;
     let ended = timeutil::normalize_to_utc(&input.ended_at).map_err(|e| e.to_string())?;
@@ -298,7 +495,6 @@ pub fn add_long_task_session(input: AddLongTaskSessionInput, state: State<AppSta
     if ended_utc < started_utc {
         return Err("结束时间不能早于开始时间".to_string());
     }
-    // 后端以两端差值复核 durationMs（防前端时钟漂移）；上限 7 天防御时钟错误。
     let duration_ms = (ended_utc - started_utc).num_milliseconds();
     if duration_ms <= 0 {
         return Err("本次用时过短，未记录会话".to_string());
@@ -309,7 +505,7 @@ pub fn add_long_task_session(input: AddLongTaskSessionInput, state: State<AppSta
 
     let now = timeutil::now_utc_string();
     let session = LongTaskSession {
-        id: schedule_core::id::new_id("s"),
+        id: input.session_id.clone(),
         started_at: started,
         ended_at: ended,
         duration_ms,
@@ -318,9 +514,13 @@ pub fn add_long_task_session(input: AddLongTaskSessionInput, state: State<AppSta
         updated_at: now.clone(),
         deleted_at: None,
     };
-    task.sessions.push(session.clone());
-    task.updated_at = now;
+    tasks[idx].sessions.push(session.clone());
+    tasks[idx].updated_at = now;
+    let task = tasks[idx].clone();
+    // 先写会话，再同步归档；归档失败返回错误，前端保留计时可重试（幂等键防重复）。
     storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    let date = long_task_session_date(&session, &tz)?;
+    sync_long_task_archive_day(&mut storage, &task, &date)?;
     Ok(session)
 }
 
@@ -339,21 +539,31 @@ pub fn update_long_task_session_note(
     state: State<AppState>,
 ) -> Result<LongTaskSession, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let config = storage.read_config().map_err(|e| e.to_string())?;
+    let tz = config.timezone.clone();
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
-    let task = tasks
-        .iter_mut()
-        .find(|t| t.id == input.task_id && t.deleted_at.is_none())
+    let idx = tasks
+        .iter()
+        .position(|t| t.id == input.task_id && t.deleted_at.is_none())
         .ok_or_else(|| "长期任务不存在或已删除".to_string())?;
-    let session = task
-        .sessions
-        .iter_mut()
-        .find(|s| s.id == input.session_id && s.deleted_at.is_none())
-        .ok_or_else(|| "会话记录不存在或已删除".to_string())?;
-    session.note = input.note.filter(|n| !n.trim().is_empty());
-    session.updated_at = timeutil::now_utc_string();
-    task.updated_at = session.updated_at.clone();
-    let out = session.clone();
+    let updated = timeutil::now_utc_string();
+    let (date, out) = {
+        let task = &mut tasks[idx];
+        let session = task
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == input.session_id && s.deleted_at.is_none())
+            .ok_or_else(|| "会话记录不存在或已删除".to_string())?;
+        session.note = input.note.filter(|n| !n.trim().is_empty());
+        session.updated_at = updated.clone();
+        let date = long_task_session_date(session, &tz)?;
+        let out = session.clone();
+        task.updated_at = updated;
+        (date, out)
+    };
+    let task = tasks[idx].clone();
     storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    sync_long_task_archive_day(&mut storage, &task, &date)?;
     Ok(out)
 }
 
@@ -376,21 +586,26 @@ pub fn undelete_long_task_session(input: LongTaskSessionRef, state: State<AppSta
 
 fn set_long_task_session_deleted(input: LongTaskSessionRef, deleted: bool, state: State<AppState>) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let config = storage.read_config().map_err(|e| e.to_string())?;
+    let tz = config.timezone.clone();
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
-    let task = tasks
-        .iter_mut()
-        .find(|t| t.id == input.task_id && t.deleted_at.is_none())
+    let idx = tasks
+        .iter()
+        .position(|t| t.id == input.task_id && t.deleted_at.is_none())
         .ok_or_else(|| "长期任务不存在或已删除".to_string())?;
-    let session = task
+    let session = tasks[idx]
         .sessions
         .iter_mut()
         .find(|s| s.id == input.session_id)
         .ok_or_else(|| "会话记录不存在".to_string())?;
+    let date = long_task_session_date(session, &tz)?;
     let now = timeutil::now_utc_string();
     session.deleted_at = if deleted { Some(now.clone()) } else { None };
     session.updated_at = now.clone();
-    task.updated_at = now;
+    tasks[idx].updated_at = now;
+    let task = tasks[idx].clone();
     storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    sync_long_task_archive_day(&mut storage, &task, &date)?;
     Ok(())
 }
 
@@ -625,13 +840,13 @@ pub fn get_calendar(start: String, end: String, state: State<AppState>) -> Resul
     let mut routine_windows = Vec::new();
     let mut d = from;
     while d <= to {
-        let weekday = d.weekday().number_from_monday();
         for rt in &data.routines {
             if !rt.enabled || rt.deleted_at.is_some() {
                 continue;
             }
             for w in &rt.time_windows {
-                if w.days_of_week.is_empty() || w.days_of_week.contains(&weekday) {
+                // V1.2.1：统一窗口命中（按星期 / 每隔 N 天）。
+                if time_window_matches_date(w, d) {
                     routine_windows.push(CalendarRoutineWindow {
                         date: timeutil::fmt_date(&d),
                         routine_id: rt.id.clone(),
@@ -676,7 +891,7 @@ pub fn get_stats(days: i64, state: State<AppState>) -> Result<StatsResult, Strin
     let archive = storage
         .load_archive_range(&month_of(&timeutil::fmt_date(&from)), &month_of(&timeutil::fmt_date(&to)))
         .map_err(|e| e.to_string())?;
-    Ok(compute_stats(&archive, &data.routines, &data.events, &data.tasks, &data.long_tasks, &data.config.timezone, from, to))
+    Ok(compute_stats(&archive, &data.routines, &data.events, &data.tasks, &data.long_tasks, from, to))
 }
 
 /// `get_review(from, to)`：日/周复盘视图。
@@ -689,7 +904,7 @@ pub fn get_review(from: String, to: String, state: State<AppState>) -> Result<Re
     let archive = storage
         .load_archive_range(&month_of(&from), &month_of(&to))
         .map_err(|e| e.to_string())?;
-    Ok(compute_review(&archive, &data.routines, &data.events, &data.tasks, f, t))
+    Ok(compute_review(&archive, &data.routines, &data.events, &data.tasks, &data.long_tasks, f, t))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1401,5 +1616,163 @@ mod tests {
         let mut empty_title = base;
         empty_title.title = "  ".to_string();
         assert!(validate_long_task(&empty_title).unwrap_err().contains("标题"));
+    }
+
+    fn lt_task(sessions: Vec<LongTaskSession>) -> LongTask {
+        LongTask {
+            id: "lt1".to_string(),
+            title: "备考".to_string(),
+            description: None,
+            start_date: "2025-01-01".to_string(),
+            due_date: "2025-12-31".to_string(),
+            status: LongTaskStatus::Active,
+            ended_at: None,
+            tags: vec!["学习".to_string()],
+            priority: schedule_core::Priority::Normal,
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+            sessions,
+        }
+    }
+
+    fn lt_session(id: &str, started: &str, ended: &str, ms: i64, note: Option<&str>, deleted: bool) -> LongTaskSession {
+        LongTaskSession {
+            id: id.to_string(),
+            started_at: started.to_string(),
+            ended_at: ended.to_string(),
+            duration_ms: ms,
+            note: note.map(|s| s.to_string()),
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: deleted.then(|| "2025-01-15T12:00:00Z".to_string()),
+        }
+    }
+
+    fn storage_with_utc(name: &str) -> (Storage, PathBuf) {
+        let dir = tmp_dir(name);
+        let mut storage = Storage::new(dir.clone());
+        storage.ensure().unwrap();
+        let mut config = Config::default();
+        config.timezone = "UTC".to_string();
+        storage.save_config(&config).unwrap();
+        (storage, dir)
+    }
+
+    #[test]
+    fn test_build_long_task_archive_entry_aggregates_sessions() {
+        let task = lt_task(vec![
+            lt_session("s1", "2025-01-15T09:00:00Z", "2025-01-15T09:20:00Z", 1_200_000, Some("A"), false),
+            lt_session("s2", "2025-01-15T10:00:00Z", "2025-01-15T10:10:00Z", 600_000, Some("B"), false),
+        ]);
+        let refs: Vec<&LongTaskSession> = task.sessions.iter().collect();
+        let entry = build_long_task_archive_entry(&task, &refs, "UTC", None).unwrap().unwrap();
+        assert_eq!(entry.source, ArchiveSource::LongTask);
+        assert_eq!(entry.source_id.as_deref(), Some("lt1"));
+        assert_eq!(entry.duration_minutes, Some(30));
+        // time / doneAt = 当天首次会话结束时刻。
+        assert_eq!(entry.time, "09:20");
+        assert_eq!(entry.done_at, "2025-01-15T09:20:00Z");
+        // note 按开始时间升序拼接。
+        assert_eq!(entry.note.as_deref(), Some("09:00 A\n10:00 B"));
+    }
+
+    #[test]
+    fn test_sync_long_task_archive_day_rebuilds_merges_and_removes() {
+        let (mut storage, _dir) = storage_with_utc("lt-archive-sync");
+        let mut task = lt_task(vec![
+            lt_session("s1", "2025-01-15T09:00:00Z", "2025-01-15T09:20:00Z", 1_200_000, None, false),
+            lt_session("s2", "2025-01-15T10:00:00Z", "2025-01-15T10:10:00Z", 600_000, None, false),
+        ]);
+        sync_long_task_archive_day(&mut storage, &task, "2025-01-15").unwrap();
+        let month = storage.load_archive_month("2025-01").unwrap();
+        let entries = &month.days["2025-01-15"].entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].duration_minutes, Some(30));
+        let id = entries[0].id.clone();
+        let time = entries[0].time.clone();
+
+        // 增加一条会话 → 条目 id / time 保持，时长重算。
+        task.sessions.push(lt_session("s3", "2025-01-15T11:00:00Z", "2025-01-15T11:15:00Z", 900_000, None, false));
+        sync_long_task_archive_day(&mut storage, &task, "2025-01-15").unwrap();
+        let month = storage.load_archive_month("2025-01").unwrap();
+        let entries = &month.days["2025-01-15"].entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, id);
+        assert_eq!(entries[0].time, time);
+        assert_eq!(entries[0].duration_minutes, Some(45));
+
+        // 全部软删除 → 聚合条目删除。
+        for s in task.sessions.iter_mut() {
+            s.deleted_at = Some("2025-01-15T12:00:00Z".to_string());
+        }
+        sync_long_task_archive_day(&mut storage, &task, "2025-01-15").unwrap();
+        let month = storage.load_archive_month("2025-01").unwrap();
+        assert!(!month.days["2025-01-15"].entries.iter().any(|e| e.source == ArchiveSource::LongTask));
+    }
+
+    #[test]
+    fn test_backfill_long_task_archives_creates_only_missing_entries() {
+        let (mut storage, _dir) = storage_with_utc("lt-backfill");
+        let task = lt_task(vec![
+            lt_session("s1", "2025-01-15T09:00:00Z", "2025-01-15T09:20:00Z", 1_200_000, Some("A"), false),
+        ]);
+        storage.save_long_tasks(&[task.clone()]).unwrap();
+        let mut cfg = Config::default();
+        cfg.timezone = "UTC".to_string();
+        let data = AppData {
+            events: vec![],
+            routines: vec![],
+            tasks: vec![],
+            long_tasks: vec![task.clone()],
+            config: cfg,
+            archive: ArchiveFile { version: schedule_core::CURRENT_VERSION, month: "2025-01".to_string(), days: Default::default() },
+        };
+        // 首次回填创建条目。
+        assert_eq!(backfill_long_task_archives(&mut storage, &data).unwrap(), 1);
+        let month = storage.load_archive_month("2025-01").unwrap();
+        let entries = &month.days["2025-01-15"].entries;
+        assert_eq!(entries.len(), 1);
+
+        // 已存在则不动（不覆盖用户可见内容）；再次回填创建数为 0。
+        let mut af = month.clone();
+        af.days.get_mut("2025-01-15").unwrap().entries[0].title = "外部标题".to_string();
+        storage.save_archive_month(&af).unwrap();
+        assert_eq!(backfill_long_task_archives(&mut storage, &data).unwrap(), 0);
+        let month = storage.load_archive_month("2025-01").unwrap();
+        assert_eq!(month.days["2025-01-15"].entries[0].title, "外部标题");
+    }
+
+    #[test]
+    fn test_validate_routine_every_days_rules() {
+        let mut r = Routine {
+            id: "r1".to_string(),
+            title: "r".to_string(),
+            description: None,
+            time_windows: vec![schedule_core::TimeWindow {
+                days_of_week: vec![],
+                start: "08:00".to_string(),
+                end: "09:00".to_string(),
+                every_days: Some(2),
+                anchor_date: Some("2025-01-01".to_string()),
+            }],
+            duration_minutes: None,
+            tags: vec![],
+            priority: schedule_core::Priority::Normal,
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+        };
+        assert!(validate_routine(&r).is_ok());
+        r.time_windows[0].every_days = Some(400);
+        assert!(validate_routine(&r).unwrap_err().contains("1–365"));
+        r.time_windows[0].every_days = Some(2);
+        r.time_windows[0].anchor_date = None;
+        assert!(validate_routine(&r).unwrap_err().contains("锚点"));
+        r.time_windows[0].every_days = None;
+        r.time_windows[0].anchor_date = None;
+        r.time_windows[0].end = "07:00".to_string();
+        assert!(validate_routine(&r).unwrap_err().contains("晚于"));
     }
 }

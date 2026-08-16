@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::AppResult;
 use crate::models::*;
 use crate::recurrence;
+use crate::routines::time_window_matches_date;
 use crate::timeutil;
 
 /// 候选来源类型。
@@ -157,7 +158,7 @@ pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> App
         }
         let done = done_today.contains(&(ArchiveSource::Routine, rt.id.clone()));
         for w in &rt.time_windows {
-            if !window_applies_today(w, local.weekday) {
+            if !time_window_matches_date(w, local.date) {
                 continue;
             }
             let (Ok(start), Ok(end)) = (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end)) else { continue };
@@ -267,7 +268,7 @@ pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> App
         }
         let done = done_today.contains(&(ArchiveSource::Routine, rt.id.clone()));
         for w in &rt.time_windows {
-            if window_applies_today(w, local.weekday) {
+            if time_window_matches_date(w, local.date) {
                 windows.push(RoutineWindowView {
                     routine_id: rt.id.clone(),
                     title: rt.title.clone(),
@@ -451,11 +452,6 @@ fn event_sort_key(ev: &Event) -> (String, String) {
 // 日常辅助
 // ---------------------------------------------------------------------------
 
-fn window_applies_today(w: &TimeWindow, weekday: u32) -> bool {
-    // daysOfWeek 为空表示每天。
-    w.days_of_week.is_empty() || w.days_of_week.contains(&weekday)
-}
-
 // ---------------------------------------------------------------------------
 // 归档辅助
 // ---------------------------------------------------------------------------
@@ -607,7 +603,7 @@ fn build_reminders(
             continue;
         }
         for w in &rt.time_windows {
-            if !window_applies_today(w, local.weekday) {
+            if !time_window_matches_date(w, local.date) {
                 continue;
             }
             let (Ok(start), Ok(end)) = (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end)) else { continue };
@@ -715,7 +711,13 @@ mod tests {
             description: None,
             time_windows: windows
                 .into_iter()
-                .map(|(start, end)| TimeWindow { days_of_week: vec![], start: start.to_string(), end: end.to_string() })
+                .map(|(start, end)| TimeWindow {
+                    days_of_week: vec![],
+                    start: start.to_string(),
+                    end: end.to_string(),
+                    every_days: None,
+                    anchor_date: None,
+                })
                 .collect(),
             duration_minutes: None,
             tags: vec![],

@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{ArchiveDay, ArchiveEntry, ArchiveSource, Event, LongTask, Routine, Task};
@@ -44,16 +44,7 @@ pub struct StatsTotals {
     pub active_days: i64,
 }
 
-/// V1.2：长期任务投入（独立口径，不计入 totals）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LongTaskStatItem {
-    pub task_id: String,
-    pub title: String,
-    pub count: i64,
-    pub duration_minutes: i64,
-}
-
+/// 统计结果（V1.2.1：长期任务投入经归档合并后自然计入 totals / trend / tagDurations）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsResult {
@@ -63,8 +54,6 @@ pub struct StatsResult {
     pub tag_durations: Vec<TagDuration>,
     pub routine_completion: Vec<RoutineCompletion>,
     pub totals: StatsTotals,
-    /// V1.2：长期任务投入统计（独立口径）。
-    pub long_task_stats: Vec<LongTaskStatItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,22 +79,21 @@ pub struct ReviewResult {
 
 const UNTAGGED: &str = "未分类";
 
-/// 完成趋势 + 标签耗时占比 + 日常完成率 + 长期任务投入（统计页）。
+/// 完成趋势 + 标签耗时占比 + 日常完成率（统计页）。
+/// V1.2.1：长期任务投入经归档聚合条目自然并入 totals / trend / tagDurations。
 pub fn compute_stats(
     days: &BTreeMap<String, ArchiveDay>,
     routines: &[Routine],
     events: &[Event],
     tasks: &[Task],
     long_tasks: &[LongTask],
-    tz: &str,
     from: NaiveDate,
     to: NaiveDate,
 ) -> StatsResult {
     let trend = build_trend(days, from, to);
-    let tag_durations = build_tag_durations(days, routines, events, tasks);
+    let tag_durations = build_tag_durations(days, routines, events, tasks, long_tasks);
     let routine_completion = build_routine_completion(days, routines, from, to);
     let totals = build_totals(&trend);
-    let long_task_stats = build_long_task_stats(long_tasks, tz, from, to);
 
     StatsResult {
         from: timeutil::fmt_date(&from),
@@ -114,7 +102,6 @@ pub fn compute_stats(
         tag_durations,
         routine_completion,
         totals,
-        long_task_stats,
     }
 }
 
@@ -124,6 +111,7 @@ pub fn compute_review(
     routines: &[Routine],
     events: &[Event],
     tasks: &[Task],
+    long_tasks: &[LongTask],
     from: NaiveDate,
     to: NaiveDate,
 ) -> ReviewResult {
@@ -156,7 +144,7 @@ pub fn compute_review(
         to: timeutil::fmt_date(&to),
         days: out_days,
         totals,
-        tag_durations: build_tag_durations(days, routines, events, tasks),
+        tag_durations: build_tag_durations(days, routines, events, tasks, long_tasks),
         routine_completion: build_routine_completion(days, routines, from, to),
     }
 }
@@ -197,12 +185,13 @@ fn build_tag_durations(
     routines: &[Routine],
     events: &[Event],
     tasks: &[Task],
+    long_tasks: &[LongTask],
 ) -> Vec<TagDuration> {
     let mut acc: HashMap<String, (i64, i64)> = HashMap::new(); // tag -> (minutes, count)
     for day in days.values() {
         for e in &day.entries {
             let minutes = e.duration_minutes.unwrap_or(0);
-            let tags = resolve_tags(e, routines, events, tasks);
+            let tags = resolve_tags(e, routines, events, tasks, long_tasks);
             let tags = if tags.is_empty() { vec![UNTAGGED.to_string()] } else { tags };
             for t in tags {
                 let entry = acc.entry(t).or_insert((0, 0));
@@ -219,7 +208,13 @@ fn build_tag_durations(
     out
 }
 
-fn resolve_tags(e: &ArchiveEntry, routines: &[Routine], events: &[Event], tasks: &[Task]) -> Vec<String> {
+fn resolve_tags(
+    e: &ArchiveEntry,
+    routines: &[Routine],
+    events: &[Event],
+    tasks: &[Task],
+    long_tasks: &[LongTask],
+) -> Vec<String> {
     let Some(sid) = &e.source_id else { return vec![] };
     match e.source {
         // 重复事件实例的归档 sourceId 形如 `e_xxx#2025-01-15`：先取 `#` 前的基础 ID 再匹配序列。
@@ -230,6 +225,12 @@ fn resolve_tags(e: &ArchiveEntry, routines: &[Routine], events: &[Event], tasks:
             .unwrap_or_default(),
         ArchiveSource::Routine => routines.iter().find(|x| &x.id == sid).map(|x| x.tags.clone()).unwrap_or_default(),
         ArchiveSource::Task => tasks.iter().find(|x| &x.id == sid).map(|x| x.tags.clone()).unwrap_or_default(),
+        // V1.2.1：长期任务按 sourceId 回查标签；任务已软删除 / 找不到 → 未分类。
+        ArchiveSource::LongTask => long_tasks
+            .iter()
+            .find(|x| x.id == base_id(sid) && x.deleted_at.is_none())
+            .map(|x| x.tags.clone())
+            .unwrap_or_default(),
         ArchiveSource::Manual => vec![],
     }
 }
@@ -237,52 +238,6 @@ fn resolve_tags(e: &ArchiveEntry, routines: &[Routine], events: &[Event], tasks:
 /// 重复实例键 `{seriesId}#{date}` → `{seriesId}`；无 `#` 原样返回。
 fn base_id(source_id: &str) -> &str {
     source_id.split('#').next().unwrap_or(source_id)
-}
-
-/// V1.2：长期任务投入（独立口径）。
-///
-/// - 仅统计有效会话（deletedAt = null）且 `startedAt` 本地日期落在窗口内（D7）；
-/// - 软删除任务的历史会话照常计入（投入是事实）；
-/// - durationMinutes = 窗口内 durationMs 求和后四舍五入到分钟；
-/// - 按 durationMinutes 降序（同分钟数按次数降序）返回。
-fn build_long_task_stats(
-    long_tasks: &[LongTask],
-    tz: &str,
-    from: NaiveDate,
-    to: NaiveDate,
-) -> Vec<LongTaskStatItem> {
-    let mut out: Vec<LongTaskStatItem> = long_tasks
-        .iter()
-        .map(|t| {
-            let mut count = 0i64;
-            let mut total_ms = 0i64;
-            for s in &t.sessions {
-                if s.deleted_at.is_some() {
-                    continue;
-                }
-                let Ok(started) = timeutil::parse_utc(&s.started_at) else { continue };
-                let d = timeutil::to_local(&started, tz).date;
-                if d >= from && d <= to {
-                    count += 1;
-                    total_ms += s.duration_ms.max(0);
-                }
-            }
-            LongTaskStatItem {
-                task_id: t.id.clone(),
-                title: t.title.clone(),
-                count,
-                duration_minutes: ((total_ms as f64) / 60_000.0).round() as i64,
-            }
-        })
-        .filter(|x| x.count > 0)
-        .collect();
-    out.sort_by(|a, b| {
-        b.duration_minutes
-            .cmp(&a.duration_minutes)
-            .then(b.count.cmp(&a.count))
-            .then(a.title.cmp(&b.title))
-    });
-    out
 }
 
 fn build_routine_completion(
@@ -333,8 +288,8 @@ fn routine_scheduled_on(r: &Routine, date: NaiveDate) -> bool {
     if !r.enabled || r.time_windows.is_empty() {
         return false;
     }
-    let weekday = date.weekday().number_from_monday();
-    r.time_windows.iter().any(|w| w.days_of_week.is_empty() || w.days_of_week.contains(&weekday))
+    // V1.2.1：统一窗口命中函数（按星期 / 每隔 N 天）。
+    r.time_windows.iter().any(|w| crate::routines::time_window_matches_date(w, date))
 }
 
 #[cfg(test)]
@@ -379,7 +334,7 @@ mod tests {
     fn test_resolve_tags_for_recurring_event_occurrence() {
         let events = vec![ev("e_xxx", vec!["工作"])];
         let e = entry(ArchiveSource::Event, "e_xxx#2025-01-15");
-        assert_eq!(resolve_tags(&e, &[], &events, &[]), vec!["工作".to_string()]);
+        assert_eq!(resolve_tags(&e, &[], &events, &[], &[]), vec!["工作".to_string()]);
     }
 
     #[test]
@@ -400,7 +355,6 @@ mod tests {
             &events,
             &[],
             &[],
-            "UTC",
             NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
         );
@@ -410,7 +364,7 @@ mod tests {
         assert!(result.tag_durations.iter().all(|t| t.tag != "未分类"));
     }
 
-    fn lt(id: &str, sessions: Vec<LongTaskSession>) -> LongTask {
+    fn lt(id: &str, tags: Vec<&str>) -> LongTask {
         LongTask {
             id: id.to_string(),
             title: id.to_string(),
@@ -419,73 +373,62 @@ mod tests {
             due_date: "2025-12-31".to_string(),
             status: LongTaskStatus::Active,
             ended_at: None,
-            tags: vec![],
+            tags: tags.into_iter().map(|s| s.to_string()).collect(),
             priority: Priority::Normal,
             created_at: String::new(),
             updated_at: String::new(),
             deleted_at: None,
-            sessions,
+            sessions: vec![],
         }
     }
 
-    fn session(id: &str, started_at: &str, duration_ms: i64, deleted: bool) -> LongTaskSession {
-        LongTaskSession {
-            id: id.to_string(),
-            started_at: started_at.to_string(),
-            ended_at: "2025-01-15T10:00:00Z".to_string(),
-            duration_ms,
+    fn longtask_entry(source_id: &str, minutes: i64) -> ArchiveEntry {
+        ArchiveEntry {
+            id: format!("a-{source_id}"),
+            time: "09:00".to_string(),
+            title: "长期".to_string(),
+            source: ArchiveSource::LongTask,
+            source_id: Some(source_id.to_string()),
             note: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-            deleted_at: deleted.then(|| "2025-01-15T11:00:00Z".to_string()),
+            duration_minutes: Some(minutes),
+            done_at: "2025-01-15T09:00:00Z".to_string(),
         }
     }
 
     #[test]
-    fn test_long_task_stats_window_filters_soft_deleted_and_rounds_minutes() {
-        let tasks = vec![
-            lt(
-                "lt1",
-                vec![
-                    session("s1", "2025-01-15T09:00:00Z", 90_000, false), // 窗口内，1.5 分钟 → 四舍五入 2
-                    session("s2", "2025-01-14T09:00:00Z", 600_000, false), // 窗口外，不计
-                    session("s3", "2025-01-15T10:00:00Z", 1_200_000, true), // 软删除，不计
-                ],
-            ),
-        ];
+    fn test_long_task_archive_entry_counts_in_totals_and_resolves_tags() {
+        let mut days = BTreeMap::new();
+        days.insert(
+            "2025-01-15".to_string(),
+            ArchiveDay {
+                entries: vec![longtask_entry("lt1", 30)],
+                summary: None,
+                updated_at: String::new(),
+            },
+        );
+        let long_tasks = vec![lt("lt1", vec!["学习"])];
         let result = compute_stats(
-            &BTreeMap::new(),
+            &days,
             &[],
             &[],
             &[],
-            &tasks,
-            "UTC",
+            &long_tasks,
             NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
         );
-        assert_eq!(result.long_task_stats.len(), 1);
-        assert_eq!(result.long_task_stats[0].count, 1);
-        assert_eq!(result.long_task_stats[0].duration_minutes, 2);
-        // 独立口径：不计入 totals。
-        assert_eq!(result.totals.duration_minutes, 0);
+        // 整合口径：长期任务合并条目自然计入 totals。
+        assert_eq!(result.totals.completed_count, 1);
+        assert_eq!(result.totals.duration_minutes, 30);
+        let work = result.tag_durations.iter().find(|t| t.tag == "学习").unwrap();
+        assert_eq!(work.minutes, 30);
     }
 
     #[test]
-    fn test_long_task_stats_counts_sessions_of_deleted_task() {
-        // 软删除任务的历史投入是事实，照常计入。
-        let mut task = lt("lt1", vec![session("s1", "2025-01-15T09:00:00Z", 60_000, false)]);
+    fn test_long_task_archive_tag_falls_back_when_task_deleted() {
+        let e = longtask_entry("lt1", 30);
+        let mut task = lt("lt1", vec!["学习"]);
         task.deleted_at = Some("2025-01-16T00:00:00Z".to_string());
-        let result = compute_stats(
-            &BTreeMap::new(),
-            &[],
-            &[],
-            &[],
-            &[task],
-            "UTC",
-            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
-            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
-        );
-        assert_eq!(result.long_task_stats.len(), 1);
-        assert_eq!(result.long_task_stats[0].count, 1);
+        let tags = resolve_tags(&e, &[], &[], &[], &[task]);
+        assert!(tags.is_empty(), "软删除任务回查失败应回退未分类");
     }
 }

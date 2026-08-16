@@ -17,6 +17,7 @@ export const SOURCE_LABEL: Record<ArchiveSource, string> = {
   event: "事件",
   routine: "日常",
   task: "浮动",
+  longtask: "长期",
   manual: "手动",
 };
 

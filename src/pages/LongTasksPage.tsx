@@ -18,7 +18,8 @@ export function LongTasksPage() {
     const all = (data?.longTasks ?? []).filter((t) => t.deletedAt == null);
     return {
       active: all
-        .filter((t) => isLongTaskInWindow(t, today))
+        // V1.2.1 F2：进行中必须 status === active，手动结束的任务只出现在「已结束」组。
+        .filter((t) => t.status === "active" && isLongTaskInWindow(t, today))
         .sort((a, b) => a.dueDate.localeCompare(b.dueDate)),
       upcoming: all
         .filter((t) => t.status === "active" && today < t.startDate)

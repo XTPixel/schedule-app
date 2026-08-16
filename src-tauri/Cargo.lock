@@ -3493,7 +3493,7 @@ dependencies = [
 
 [[package]]
 name = "schedule-app"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "chrono",
  "schedule-core",
@@ -3509,7 +3509,7 @@ dependencies = [
 
 [[package]]
 name = "schedule-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "boa_engine",
  "chrono",

@@ -292,7 +292,7 @@ impl Storage {
     }
 }
 
-/// 迁移步骤分发：v0 → v1 → v2 → v3 → v4 → v5（`file` 为相对数据目录的文件名）。
+/// 迁移步骤分发：v0 → … → v6（`file` 为相对数据目录的文件名）。
 fn migrate_step(file: &str, from: u32, value: Value) -> Value {
     match from {
         0 => migrate_v0_to_v1(value),
@@ -300,6 +300,7 @@ fn migrate_step(file: &str, from: u32, value: Value) -> Value {
         2 => migrate_v2_to_v3(file, value),
         3 => migrate_v3_to_v4(file, value),
         4 => migrate_v4_to_v5(value),
+        5 => migrate_v5_to_v6(file, value),
         _ => value,
     }
 }
@@ -445,6 +446,29 @@ fn migrate_v3_to_v4(file: &str, mut value: Value) -> Value {
 fn migrate_v4_to_v5(mut value: Value) -> Value {
     if let Some(obj) = value.as_object_mut() {
         obj.insert("version".to_string(), json!(5));
+    }
+    value
+}
+
+/// v5 → v6：写入版本号 6；为 `routines.json` 的每个时间窗口显式补齐
+/// V1.2.1 新增字段 `everyDays: null` / `anchorDate: null`（按星期模式）。
+fn migrate_v5_to_v6(file: &str, mut value: Value) -> Value {
+    let Some(obj) = value.as_object_mut() else { return value };
+    obj.insert("version".to_string(), json!(6));
+
+    if file == "routines.json" {
+        if let Some(routines) = obj.get_mut("routines").and_then(|v| v.as_array_mut()) {
+            for r in routines.iter_mut() {
+                if let Some(windows) = r.get_mut("timeWindows").and_then(|v| v.as_array_mut()) {
+                    for w in windows.iter_mut() {
+                        if let Some(o) = w.as_object_mut() {
+                            o.entry("everyDays").or_insert(Value::Null);
+                            o.entry("anchorDate").or_insert(Value::Null);
+                        }
+                    }
+                }
+            }
+        }
     }
     value
 }
@@ -611,16 +635,35 @@ mod tests {
         let events = storage.read_events().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "e1");
-        // v3→v4→v5 对数据文件结构零改动：保存后除 version 外不新增配置类字段。
+        // v3→v4→v5→v6 对数据文件结构零改动：保存后除 version 外不新增配置类字段。
         storage.save_events(&events).unwrap();
         let raw = fs::read_to_string(dir.join("events.json")).unwrap();
         assert!(!raw.contains("tagColors"));
-        assert!(raw.contains("\"version\": 5"));
+        assert!(raw.contains("\"version\": 6"));
     }
 
     #[test]
-    fn test_long_tasks_missing_file_defaults_empty_and_roundtrips() {
-        let dir = tmp_dir("long-tasks");
+    fn test_migrate_v5_routines_adds_every_days_fields() {
+        let dir = tmp_dir("migrate-v5-routines");
+        fs::write(
+            dir.join("routines.json"),
+            r#"{"version":5,"routines":[{"id":"r1","title":"r","timeWindows":[{"daysOfWeek":[1,3],"start":"08:00","end":"09:00"}],"enabled":true,"createdAt":"2025-01-01T00:00:00Z","updatedAt":"2025-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+        let mut storage = Storage::new(dir.clone());
+        let routines = storage.read_routines().unwrap();
+        assert_eq!(routines[0].time_windows[0].every_days, None);
+        assert_eq!(routines[0].time_windows[0].anchor_date, None);
+        // 保存后显式写入补齐字段与 version 6。
+        storage.save_routines(&routines).unwrap();
+        let raw = fs::read_to_string(dir.join("routines.json")).unwrap();
+        assert!(raw.contains("\"version\": 6"));
+        assert!(raw.contains("\"everyDays\": null"));
+        assert!(raw.contains("\"anchorDate\": null"));
+    }
+
+    #[test]
+    fn test_long_tasks_missing_file_defaults_empty_and_roundtrips() {        let dir = tmp_dir("long-tasks");
         let mut storage = Storage::new(dir.clone());
         storage.ensure().unwrap();
         // 新目录：long_tasks.json 缺失 → 空列表，不报错（v1.0/v1.1 旧备份兼容）。
@@ -646,7 +689,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].title, "备考");
         let raw = fs::read_to_string(dir.join("long_tasks.json")).unwrap();
-        assert!(raw.contains("\"version\": 5"));
+        assert!(raw.contains("\"version\": 6"));
         assert!(raw.contains("\"longTasks\""));
     }
 

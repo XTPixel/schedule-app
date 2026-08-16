@@ -21,6 +21,7 @@ pub mod id;
 pub mod models;
 pub mod nlp;
 pub mod recurrence;
+pub mod routines;
 pub mod search;
 pub mod stats;
 pub mod storage;
@@ -37,9 +38,10 @@ pub use error::{AppError, AppResult};
 pub use models::*;
 pub use nlp::{parse_natural_language, NlpEvent};
 pub use recurrence::{expand_events, CalendarData, CalendarRoutineWindow, Occurrence};
+pub use routines::time_window_matches_date;
 pub use search::{search, SearchQuery, SearchResult};
 pub use stats::{
-    compute_review, compute_stats, DayCount, LongTaskStatItem, ReviewDay, ReviewResult,
-    RoutineCompletion, StatsResult, StatsTotals, TagDuration,
+    compute_review, compute_stats, DayCount, ReviewDay, ReviewResult, RoutineCompletion, StatsResult,
+    StatsTotals, TagDuration,
 };
 pub use storage::{MtimeStatus, Storage};

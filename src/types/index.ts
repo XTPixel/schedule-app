@@ -2,7 +2,7 @@
 
 export type Priority = "high" | "normal" | "low";
 export type ItemStatus = "active" | "completed" | "cancelled";
-export type ArchiveSource = "event" | "routine" | "task" | "manual";
+export type ArchiveSource = "event" | "routine" | "task" | "longtask" | "manual";
 export type CandidateSource = "event" | "routine" | "task";
 /** V1.2：计时器来源包含长期任务（但长期任务不进入候选引擎）。 */
 export type TimerSourceType = CandidateSource | "longtask";
@@ -42,6 +42,10 @@ export interface TimeWindow {
   daysOfWeek: number[]; // 1=周一 ... 7=周日
   start: string; // HH:mm
   end: string; // HH:mm
+  /** V1.2.1：每隔 N 天一次（1..365）；null = 按星期模式。 */
+  everyDays: number | null;
+  /** V1.2.1：每隔 N 天模式的锚点日期 YYYY-MM-DD。 */
+  anchorDate: string | null;
 }
 
 export interface Routine {
@@ -313,14 +317,7 @@ export interface StatsTotals {
   activeDays: number;
 }
 
-/** V1.2：长期任务投入统计项（独立口径，不计入 totals）。 */
-export interface LongTaskStatItem {
-  taskId: string;
-  title: string;
-  count: number;
-  durationMinutes: number;
-}
-
+/** V1.2.1：长期任务投入经归档聚合自然计入 totals，不再返回独立区块。 */
 export interface StatsResult {
   from: string;
   to: string;
@@ -328,7 +325,6 @@ export interface StatsResult {
   tagDurations: TagDuration[];
   routineCompletion: RoutineCompletion[];
   totals: StatsTotals;
-  longTaskStats: LongTaskStatItem[];
 }
 
 export interface ReviewDay {

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/版本-1.2.0-2563EB" />
+  <img alt="Version" src="https://img.shields.io/badge/版本-1.2.1-2563EB" />
   <img alt="Platform" src="https://img.shields.io/badge/平台-Windows-0078D6" />
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2.x-FFC131" />
   <img alt="React" src="https://img.shields.io/badge/React-18-61DAFB" />
@@ -36,6 +36,7 @@
 ### 录入与提醒
 
 - **自然语言快速录入**：如「明天下午3点开会」，解析失败自动降级表单；
+- **日常**：按星期循环，或「每隔 N 天」模式（锚点日期 + 间隔）；
 - **重复事件**：daily / weekly / monthly / yearly / custom + 多级提前提醒；
 - **系统提醒**：事件开始、日常窗口开始/即将结束、浮动事项截止；已完成事项不再提醒；支持优先级分级、免打扰时段与提示音开关。
 
@@ -51,8 +52,8 @@
 - **计划窗口**：开始 / 截止日期，窗口内任意一天都可以开始投入；
 - **会话式执行**：开始 → 暂停 / 继续 → 终止；每次终止记一条投入记录（用时 + 可选收获），任务保持进行中、可反复投入；
 - **「现在」页独立区域**：显示当前窗口内的长期任务，不进入五层候选推荐；
-- **详情抽屉**：汇总卡 + 投入时间线，收获可补填 / 编辑，记录可删除 / 撤回；
-- **独立统计与搜索**：统计页「长期任务投入」区块（不计入完成统计）；搜索支持标题 / 描述 / 标签 / 会话收获。
+- **归档与统计整合**：每天同一长期任务合并为一条归档条目，进入实际时间轴、归档页与全局统计；标签耗时同步计入；
+- **详情抽屉**：汇总卡 + 投入时间线，收获可补填 / 编辑，记录可删除 / 撤回。
 
 ### 数据与系统
 
@@ -71,7 +72,7 @@
 | 桌面壳 | Tauri 2.x（Rust 后端） |
 | 前端 | React 18 + TypeScript 5 + Vite 5 + Tailwind CSS 3 + Zustand 4 |
 | 核心引擎 | `schedule-core` 纯 Rust crate（模型 / 存储 / 候选推荐 / 重复展开 / NLP / 搜索 / 统计 / 钩子） |
-| 存储 | 本地 JSON，版本迁移 v0 → v5，原子写入 + `.bak` + mtime 冲突检测 |
+| 存储 | 本地 JSON，版本迁移 v0 → v6，原子写入 + `.bak` + mtime 冲突检测 |
 
 ## 快速开始
 
@@ -157,8 +158,8 @@ hooks/
 
 ## 版本
 
-- 当前应用版本：**1.2.0**
-- 数据版本：`CURRENT_VERSION = 5`
+- 当前应用版本：**1.2.1**
+- 数据版本：`CURRENT_VERSION = 6`
 
 ## 许可证
 

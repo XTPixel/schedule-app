@@ -21,6 +21,7 @@ export function ArchivePage() {
   const updateArchiveDay = useAppStore((s) => s.updateArchiveDay);
   const askConfirm = useAppStore((s) => s.askConfirm);
   const pushToast = useAppStore((s) => s.pushToast);
+  const openDrawer = useAppStore((s) => s.openDrawer);
 
   const tz = data?.config.timezone ?? "Asia/Shanghai";
   const [viewDate, setViewDate] = useState(() => todayInTz(tz));
@@ -157,26 +158,49 @@ export function ArchivePage() {
           <div className="py-6 text-center text-sm text-gray-400 dark:text-slate-500">这一天还没有记录</div>
         ) : (
           <ol className="space-y-2">
-            {entries.map((e) => (
-              <li key={e.id} className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-gray-50 dark:hover:bg-slate-700">
-                <span className="w-24 shrink-0">
-                  <TimeField compact value={e.time} onChange={(t) => saveEntry({ ...e, time: t })} />
-                </span>
+            {entries.map((e) => {
+              // V1.2.1：长期任务条目由会话自动聚合，禁止在此编辑 / 删除；点击跳转任务详情。
+              const isLongTask = e.source === "longtask";
+              const longTask = isLongTask
+                ? data?.longTasks.find((x) => x.id === e.sourceId && x.deletedAt == null)
+                : undefined;
+              return (
+              <li
+                key={e.id}
+                className={`flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-gray-50 dark:hover:bg-slate-700 ${isLongTask && longTask ? "cursor-pointer" : ""}`}
+                onClick={() => {
+                  if (isLongTask && longTask) openDrawer("longtask", longTask);
+                }}
+              >
+                {isLongTask ? (
+                  <span className="w-24 shrink-0 tabular-nums text-sm text-gray-700 dark:text-slate-200">{e.time}</span>
+                ) : (
+                  <span className="w-24 shrink-0">
+                    <TimeField compact value={e.time} onChange={(t) => saveEntry({ ...e, time: t })} />
+                  </span>
+                )}
                 <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" />
                 <div className="min-w-0 flex-1">
-                  <InlineEdit
-                    value={e.title}
-                    onSave={(title) => saveEntry({ ...e, title })}
-                    className="font-medium text-gray-900 dark:text-slate-100"
-                  />
+                  {isLongTask ? (
+                    <div className="font-medium text-gray-900 dark:text-slate-100">{e.title}</div>
+                  ) : (
+                    <InlineEdit
+                      value={e.title}
+                      onSave={(title) => saveEntry({ ...e, title })}
+                      className="font-medium text-gray-900 dark:text-slate-100"
+                    />
+                  )}
                   <div className="mt-0.5 flex gap-2 text-xs text-gray-400 dark:text-slate-500">
                     <span>{SOURCE_LABEL[e.source]}</span>
-                    {e.note && <span>{e.note}</span>}
+                    {e.note && <span className="whitespace-pre-line">{e.note}</span>}
+                    {isLongTask && <span>（由长期任务会话自动聚合）</span>}
                   </div>
                 </div>
                 <button
                   type="button"
-                  className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-50"
+                  disabled={isLongTask}
+                  title={isLongTask ? "该条目由长期任务会话自动聚合，删除 / 编辑请到长期任务详情" : undefined}
+                  className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
                   onClick={() =>
                     askConfirm("删除记录", `删除「${e.title || "该记录"}」？`, () => removeEntry(e.id))
                   }
@@ -184,7 +208,8 @@ export function ArchivePage() {
                   删除
                 </button>
               </li>
-            ))}
+              );
+            })}
           </ol>
         )}
       </div>

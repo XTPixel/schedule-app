@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 /// v1 = MVP(0.1.0) / Phase1(0.2.0) / Phase2(0.3.0)；
 /// v2 = Phase3(0.4.0)；v3 = V3.0(0.5.0)：新增提醒分级配置；
 /// v4 = V3.1(1.0.0-rc.1) 及 1.0.x / 1.1.x：标签颜色；
-/// v5 = V1.2(1.2.0)：新增长期任务（long_tasks.json，独立文件）。
-pub const CURRENT_VERSION: u32 = 5;
+/// v5 = V1.2(1.2.0)：新增长期任务（long_tasks.json，独立文件）；
+/// v6 = V1.2.1(1.2.1)：日常时间窗口支持「每隔 N 天」（everyDays / anchorDate）。
+pub const CURRENT_VERSION: u32 = 6;
 
 /// 默认逾期日常宽限小时数（§8.3，MVP 硬编码）。
 pub const DEFAULT_GRACE_HOURS: i64 = 4;
@@ -48,6 +49,8 @@ pub enum ArchiveSource {
     Event,
     Routine,
     Task,
+    /// V1.2.1：长期任务会话聚合条目（每天每任务一条）。
+    LongTask,
     #[default]
     Manual,
 }
@@ -134,6 +137,12 @@ pub struct TimeWindow {
     pub start: String,
     /// 墙钟时间 HH:mm。
     pub end: String,
+    /// V1.2.1：Some(n) = 每隔 n 天一次（1..=365）；None = 按星期模式。
+    #[serde(default)]
+    pub every_days: Option<u32>,
+    /// V1.2.1：每隔 N 天模式的锚点日期 YYYY-MM-DD。
+    #[serde(default)]
+    pub anchor_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

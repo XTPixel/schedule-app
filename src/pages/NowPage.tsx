@@ -82,8 +82,12 @@ export function NowPage() {
   const todayDate = todayInTz(tz);
 
   // V1.2：长期任务独立区域（不进入候选、不受跳过/稍后隐藏）。
+  // V1.2.1 F1：显式排除已删除 / 已结束任务，保证列表页删除或结束后立即消失。
   const longTasks = useMemo(
-    () => (data?.longTasks ?? []).filter((t) => isLongTaskInWindow(t, todayDate)),
+    () =>
+      (data?.longTasks ?? []).filter(
+        (t) => t.deletedAt == null && t.status === "active" && isLongTaskInWindow(t, todayDate),
+      ),
     [data, todayDate],
   );
 

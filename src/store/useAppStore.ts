@@ -79,6 +79,8 @@ export interface TimerState {
   running: boolean;
   /** V1.2：长期任务本次会话首次开始时间戳（继续/暂停不覆盖）。 */
   sessionStartedAt?: number;
+  /** V1.2.1：终止落库的幂等键；写入失败重试时复用，成功后随计时一并清除。 */
+  sessionId?: string;
 }
 
 interface SnoozeEntry {
@@ -108,6 +110,11 @@ function addDays(date: string, n: number): string {
   const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(dt.getUTCDate()).padStart(2, "0");
   return `${yy}-${mm}-${dd}`;
+}
+
+/** V1.2.1：前端生成的会话幂等键。 */
+function newSessionId(): string {
+  return `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function loadJSON<T>(key: string, fallback: T): T {
@@ -423,7 +430,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         id: "",
         title: "",
         description: null,
-        timeWindows: [{ daysOfWeek: [], start: "08:00", end: "09:00" }],
+        timeWindows: [{ daysOfWeek: [], start: "08:00", end: "09:00", everyDays: null, anchorDate: null }],
         durationMinutes: null,
         tags: [],
         priority: "normal",
@@ -648,6 +655,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       accumulatedMs: existing?.accumulatedMs ?? 0,
       running: true,
       sessionStartedAt,
+      // 新会话生成幂等键；暂停/继续/重试均复用。
+      sessionId: existing?.sessionId ?? newSessionId(),
     };
     set({ timers });
     saveJSON(TIMER_KEY, timers);
@@ -668,6 +677,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const elapsedMs = Math.max(0, timer.accumulatedMs + (timer.running ? Date.now() - timer.startedAt : 0));
     const sessionStart =
       timer.sessionStartedAt ?? (timer.startedAt > 0 ? timer.startedAt : Date.now() - elapsedMs);
+    // V1.2.1：幂等键随计时持久化；失败重试不会重复落库会话。
+    const sessionId = timer.sessionId ?? newSessionId();
+    if (!timer.sessionId) {
+      const timers = { ...get().timers, [task.id]: { ...timer, sessionId } };
+      set({ timers });
+      saveJSON(TIMER_KEY, timers);
+    }
     try {
       const session = await withExternalConflict(() =>
         api.addLongTaskSession({
@@ -676,6 +692,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           endedAt: new Date().toISOString(),
           durationMs: elapsedMs,
           note: null,
+          sessionId,
         }),
       );
       if (session === null) return null;
@@ -855,12 +872,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
   async deleteLongTask(id) {
     try {
       const original = get().data?.longTasks.find((x) => x.id === id);
-      // 删除前丢弃进行中的计时（不记录会话，且撤回不恢复计时）。
       const hadTimer = Boolean(get().timers[id]);
-      if (hadTimer) get().dropTimer(id);
+      // V1.2.1 F3：先删后端，成功后才丢弃计时——删除失败时保留进行中的计时。
       const r = await withExternalConflict(() => api.deleteLongTask(id));
       if (r === null) return;
+      if (hadTimer) get().dropTimer(id);
       await get().refresh();
+      // F4：删除成功后同步 / 关闭该任务的抽屉，保证所有入口一致。
+      const drawer = get().drawer;
+      if (drawer?.kind === "longtask" && (drawer.draft as { id?: string }).id === id) {
+        get().closeDrawer();
+      } else {
+        get().syncLongTaskDrawer(id);
+      }
       if (original) {
         const msg = hadTimer
           ? `已删除「${original.title || "长期任务"}」（进行中的计时已丢弃）`
