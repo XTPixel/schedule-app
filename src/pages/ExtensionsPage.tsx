@@ -1,7 +1,7 @@
 // 扩展页：事项模板 · 脚本钩子。
 // Git 一键备份与移动端只读功能已按用户要求完全移除。
 // 交互遵循 §7.5：行内编辑、非模态、危险确认才弹窗；V3.1 起抽屉改为显式保存（不涉及本页）。
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api/ipc";
 import { useAppStore, withExternalConflict } from "../store/useAppStore";
 import { TagInput } from "../components/TagInput";
@@ -297,17 +297,32 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
   // 本地草稿：编辑过程中仅改草稿，失焦/结构性操作时才提交（§7.5 失焦自动保存）。
   // 编辑器随 editingId 条件挂载/卸载，useState 初始值即当前模板，无需跟随 prop 重同步。
   const [draft, setDraft] = useState<Template>(template);
+  // 同步维护最新草稿引用，避免 blur 回调闭包读到旧 draft 覆盖刚输入的内容。
+  const draftRef = useRef<Template>(draft);
 
   function commit(next: Template) {
+    draftRef.current = next;
     setDraft(next);
     onChange(next);
   }
+  /** 把当前本地草稿提交给父组件（用于失焦保存）。 */
+  function commitDraft() {
+    onChange(draftRef.current);
+  }
   function patchItem(i: number, patch: Partial<TemplateItem>) {
-    setDraft((d) => ({ ...d, items: d.items.map((it, idx) => (idx === i ? { ...it, ...patch } : it)) }));
+    const next: Template = {
+      ...draftRef.current,
+      items: draftRef.current.items.map((it, idx) => (idx === i ? { ...it, ...patch } : it)),
+    };
+    draftRef.current = next;
+    setDraft(next);
   }
   function patchItemCommit(i: number, patch: Partial<TemplateItem>) {
-    const items = draft.items.map((it, idx) => (idx === i ? { ...it, ...patch } : it));
-    commit({ ...draft, items });
+    const next: Template = {
+      ...draftRef.current,
+      items: draftRef.current.items.map((it, idx) => (idx === i ? { ...it, ...patch } : it)),
+    };
+    commit(next);
   }
   function addItem() {
     const item: TemplateItem = {
@@ -324,10 +339,10 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
       windowStart: "08:00",
       windowEnd: "09:00",
     };
-    commit({ ...draft, items: [...draft.items, item] });
+    commit({ ...draftRef.current, items: [...draftRef.current.items, item] });
   }
   function removeItem(i: number) {
-    commit({ ...draft, items: draft.items.filter((_, idx) => idx !== i) });
+    commit({ ...draftRef.current, items: draftRef.current.items.filter((_, idx) => idx !== i) });
   }
   return (
     <div className="mt-3 space-y-2 border-t border-gray-100 dark:border-slate-700 pt-3">
@@ -347,7 +362,7 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
               value={it.title}
               placeholder="标题"
               onChange={(e) => patchItem(i, { title: e.target.value })}
-              onBlur={() => onChange(draft)}
+              onBlur={commitDraft}
             />
             <select
               className={inputCls}
@@ -366,7 +381,7 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
             <TagInput
               value={it.tags}
               onChange={(tags) => patchItem(i, { tags })}
-              onBlur={() => onChange(draft)}
+              onBlur={commitDraft}
             />
             {it.kind === "event" ? (
               <>
@@ -385,7 +400,7 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
                       className={inputCls}
                       value={it.startTime ?? "09:00"}
                       onChange={(e) => patchItem(i, { startTime: e.target.value })}
-                      onBlur={() => onChange(draft)}
+                      onBlur={commitDraft}
                     />
                     <span className="text-gray-400">–</span>
                     <input
@@ -393,7 +408,7 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
                       className={inputCls}
                       value={it.endTime ?? ""}
                       onChange={(e) => patchItem(i, { endTime: e.target.value || null })}
-                      onBlur={() => onChange(draft)}
+                      onBlur={commitDraft}
                     />
                   </>
                 )}
@@ -405,7 +420,7 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
                   className={inputCls}
                   value={it.windowStart ?? "08:00"}
                   onChange={(e) => patchItem(i, { windowStart: e.target.value })}
-                  onBlur={() => onChange(draft)}
+                  onBlur={commitDraft}
                 />
                 <span className="text-gray-400">–</span>
                 <input
@@ -413,7 +428,7 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
                   className={inputCls}
                   value={it.windowEnd ?? "09:00"}
                   onChange={(e) => patchItem(i, { windowEnd: e.target.value })}
-                  onBlur={() => onChange(draft)}
+                  onBlur={commitDraft}
                 />
               </>
             )}
@@ -424,7 +439,7 @@ function TemplateEditor({ template, onChange }: { template: Template; onChange: 
               value={it.durationMinutes ?? ""}
               placeholder="分钟"
               onChange={(e) => patchItem(i, { durationMinutes: Number(e.target.value) || null })}
-              onBlur={() => onChange(draft)}
+              onBlur={commitDraft}
             />
           </div>
         </div>

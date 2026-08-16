@@ -32,6 +32,16 @@ export function TagInput({ value, onChange, onBlur }: Props) {
   function remove(t: string) {
     onChange(value.filter((x) => x !== t));
   }
+  /** 失焦时把输入框中尚未回车确认的文本补录为标签，避免「填了直接点保存就丢失」。 */
+  function commitPending() {
+    const t = text.trim();
+    if (!t || value.includes(t)) {
+      setText("");
+      return;
+    }
+    setText("");
+    onChange([...value, t]);
+  }
 
   return (
     <div>
@@ -59,11 +69,15 @@ export function TagInput({ value, onChange, onBlur }: Props) {
           onFocus={() => setFocused(true)}
           onBlur={() => {
             setFocused(false);
+            // 先把未确认文本落成标签，再通知外层（此时外层能读到最新 tags）。
+            commitPending();
             onBlur?.();
           }}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" || e.key === ",") {
+              // 中文输入法选词确认的 Enter/逗号不当作新增；compositionend 后仍可失焦兜底提交。
+              if (e.nativeEvent.isComposing) return;
               e.preventDefault();
               add(text);
             } else if (e.key === "Backspace" && !text && value.length) {
