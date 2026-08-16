@@ -296,8 +296,8 @@ pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> App
         archive: archive_today,
     };
 
-    // ---- 提醒 ----
-    let due_reminders = build_reminders(data, &now, &local, &config);
+    // ---- 提醒（v1.1.0：已完成的来源不再生成提醒） ----
+    let due_reminders = build_reminders(data, &now, &local, &config, &done_today);
 
     Ok(CandidatesResult {
         now: timeutil::to_utc_string(&now),
@@ -514,6 +514,7 @@ fn build_reminders(
     now: &DateTime<Utc>,
     local: &timeutil::LocalNow,
     config: &Config,
+    done_today: &std::collections::HashSet<(ArchiveSource, String)>,
 ) -> Vec<ReminderNotice> {
     let mut out = Vec::new();
     let tz = timeutil::resolve_tz(&config.timezone);
@@ -550,6 +551,10 @@ fn build_reminders(
     let occurrences = recurrence::expand_events(&data.events, local.date, horizon, &config.timezone);
     for occ in &occurrences {
         let ev = &occ.event;
+        // v1.1.0：已完成的来源不执行提醒。
+        if ev.completed_at.is_some() || done_today.contains(&(ArchiveSource::Event, occ.key.clone())) {
+            continue;
+        }
         if ev.all_day {
             continue;
         }
@@ -593,9 +598,12 @@ fn build_reminders(
         }
     }
 
-    // 日常窗口开始/即将结束。
+    // 日常窗口开始/即将结束（v1.1.0：当日已完成的日常不再提醒）。
     for rt in &data.routines {
         if !rt.enabled || rt.deleted_at.is_some() {
+            continue;
+        }
+        if done_today.contains(&(ArchiveSource::Routine, rt.id.clone())) {
             continue;
         }
         for w in &rt.time_windows {
@@ -631,9 +639,9 @@ fn build_reminders(
         }
     }
 
-    // 浮动事项截止日提醒。
+    // 浮动事项截止日提醒（v1.1.0：已完成的事项不再提醒）。
     for t in &data.tasks {
-        if t.deleted_at.is_some() || t.status != ItemStatus::Active {
+        if t.deleted_at.is_some() || t.status != ItemStatus::Active || t.completed_at.is_some() {
             continue;
         }
         if let Some(dl) = &t.deadline {
@@ -670,6 +678,7 @@ mod tests {
             events,
             routines,
             tasks: vec![],
+            long_tasks: vec![],
             config: Config::default(),
             archive: ArchiveFile {
                 version: crate::models::CURRENT_VERSION,
@@ -718,6 +727,42 @@ mod tests {
         }
     }
 
+    fn task_at(id: &str, deadline: Option<&str>, status: ItemStatus) -> Task {
+        Task {
+            id: id.to_string(),
+            title: "浮动事项".to_string(),
+            description: None,
+            priority: Priority::Normal,
+            deadline: deadline.map(|s| s.to_string()),
+            tags: vec![],
+            status,
+            sort_order: 0,
+            created_at: String::new(),
+            updated_at: String::new(),
+            completed_at: None,
+            deleted_at: None,
+        }
+    }
+
+    /// 向测试数据写入一条「今日已完成」归档（用于验证已完成来源不再提醒）。
+    fn mark_done_today(data: &mut AppData, date: &str, source: ArchiveSource, source_id: &str) {
+        let day = data.archive.days.entry(date.to_string()).or_insert_with(|| crate::models::ArchiveDay {
+            entries: vec![],
+            summary: None,
+            updated_at: String::new(),
+        });
+        day.entries.push(crate::models::ArchiveEntry {
+            id: format!("a-{source_id}"),
+            time: "08:00".to_string(),
+            title: "已完成".to_string(),
+            source,
+            source_id: Some(source_id.to_string()),
+            note: None,
+            duration_minutes: None,
+            done_at: format!("{date}T08:00:00Z"),
+        });
+    }
+
     #[test]
     fn test_multi_level_reminders_have_distinct_dedup_keys() {
         // 2025-01-15 为周三；08:00 UTC = 本地 08:00（UTC 时区）。
@@ -754,5 +799,80 @@ mod tests {
             .collect();
         keys.sort();
         assert_eq!(keys, vec!["routine_window:r1:08:55:end", "routine_window:r1:09:00:start"]);
+    }
+
+    #[test]
+    fn test_completed_task_does_not_remind() {
+        // v1.1.0：已完成（status=completed）的浮动事项，即使今日截止也不生成提醒。
+        let task = task_at("t1", Some("2025-01-15T09:00:00Z"), ItemStatus::Completed);
+        let mut data = base_data(vec![], vec![]);
+        data.tasks = vec![task];
+        let mut config = Config::default();
+        config.timezone = "UTC".to_string();
+        let result = compute_candidates(&data, "2025-01-15T08:00:00Z", &config).unwrap();
+
+        assert!(!result.due_reminders.iter().any(|r| r.kind == "task_deadline"));
+    }
+
+    #[test]
+    fn test_completed_at_task_does_not_remind() {
+        // v1.1.0：防御性检查——completedAt 已设置的事项即使 status 尚未同步，也不提醒。
+        let mut task = task_at("t1", Some("2025-01-15T09:00:00Z"), ItemStatus::Active);
+        task.completed_at = Some("2025-01-15T08:00:00Z".to_string());
+        let mut data = base_data(vec![], vec![]);
+        data.tasks = vec![task];
+        let mut config = Config::default();
+        config.timezone = "UTC".to_string();
+        let result = compute_candidates(&data, "2025-01-15T08:00:00Z", &config).unwrap();
+
+        assert!(!result.due_reminders.iter().any(|r| r.kind == "task_deadline"));
+    }
+
+    #[test]
+    fn test_completed_recurring_occurrence_today_does_not_remind() {
+        // v1.1.0：重复事件「完成仅归档本次」后，今日实例不应继续触发事件提醒。
+        let mut ev = event_at("e1", "2025-01-15T09:00:00Z", vec![]);
+        ev.repeat = Some(crate::models::Repeat {
+            repeat_type: "daily".to_string(),
+            interval: 1,
+            days_of_week: vec![],
+            end: None,
+        });
+        let mut data = base_data(vec![ev], vec![]);
+        mark_done_today(&mut data, "2025-01-15", ArchiveSource::Event, "e1#2025-01-15");
+        let mut config = Config::default();
+        config.timezone = "UTC".to_string();
+        let result = compute_candidates(&data, "2025-01-15T08:50:00Z", &config).unwrap();
+
+        assert!(!result
+            .due_reminders
+            .iter()
+            .any(|r| r.source_id == "e1#2025-01-15" && r.kind == "event_start"));
+    }
+
+    #[test]
+    fn test_completed_routine_today_does_not_remind() {
+        // v1.1.0：当日已完成的日常，不再触发窗口开始/即将结束提醒。
+        let rt = routine_at("r1", vec![("09:00", "10:00")]);
+        let mut data = base_data(vec![], vec![rt]);
+        mark_done_today(&mut data, "2025-01-15", ArchiveSource::Routine, "r1");
+        let mut config = Config::default();
+        config.timezone = "UTC".to_string();
+        let result = compute_candidates(&data, "2025-01-15T08:50:00Z", &config).unwrap();
+
+        assert!(!result.due_reminders.iter().any(|r| r.kind == "routine_window"));
+    }
+
+    #[test]
+    fn test_active_task_deadline_still_reminds() {
+        // 回归保护：未完成的浮动事项今日截止时仍正常提醒。
+        let task = task_at("t1", Some("2025-01-15T09:00:00Z"), ItemStatus::Active);
+        let mut data = base_data(vec![], vec![]);
+        data.tasks = vec![task];
+        let mut config = Config::default();
+        config.timezone = "UTC".to_string();
+        let result = compute_candidates(&data, "2025-01-15T08:00:00Z", &config).unwrap();
+
+        assert!(result.due_reminders.iter().any(|r| r.kind == "task_deadline" && r.source_id == "t1"));
     }
 }

@@ -1,10 +1,19 @@
 import { useEffect, useState } from "react";
+import dayjs from "dayjs";
 import { useAppStore } from "../store/useAppStore";
 import { fmtDate, fmtTime } from "../lib/time";
 import { PRIORITY_BADGE, PRIORITY_LABEL } from "../lib/format";
 import { TagChips } from "../components/TagFilter";
 import { tagChipClasses } from "../lib/tagColor";
 import type { SearchQuery } from "../types";
+
+function fmtDurationLong(ms: number): string {
+  const min = Math.max(0, Math.round(ms / 60_000));
+  if (min < 60) return `${min} 分钟`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m ? `${h} 小时 ${m} 分` : `${h} 小时`;
+}
 
 /** 搜索页：标题 / 标签 / 日期范围组合筛选（Phase 1）。 */
 export function SearchPage() {
@@ -44,6 +53,8 @@ export function SearchPage() {
   const ev = results?.events ?? [];
   const tasks = results?.tasks ?? [];
   const routines = results?.routines ?? [];
+  const longTasks = results?.longTasks ?? [];
+  const query = text.trim().toLowerCase();
 
   return (
     <div className="mx-auto max-w-3xl px-6 py-8">
@@ -151,6 +162,31 @@ export function SearchPage() {
               onClick: () => openDrawer("routine", r),
             }))}
           />
+          <ResultSection
+            title="长期任务"
+            count={longTasks.length}
+            empty="无匹配长期任务"
+            items={longTasks.map((t) => {
+              const allMatched = t.sessions.filter(
+                (s) => s.deletedAt == null && query && (s.note ?? "").toLowerCase().includes(query),
+              );
+              const shown = allMatched.slice(0, 3).map((s) => {
+                const started = dayjs(s.startedAt);
+                return `${started.format("M月D日 HH:mm")} · ${fmtDurationLong(s.durationMs)} · ${s.note ?? ""}`;
+              });
+              const extraLines =
+                allMatched.length > 3 ? [...shown, `共 ${allMatched.length} 条命中收获`] : shown;
+              return {
+                id: t.id,
+                title: t.title,
+                sub: `${t.startDate} → ${t.dueDate}`,
+                priority: t.priority,
+                tags: t.tags,
+                extraLines,
+                onClick: () => openDrawer("longtask", t),
+              };
+            })}
+          />
         </div>
       )}
 
@@ -169,6 +205,8 @@ interface Item {
   sub?: string;
   priority: "high" | "normal" | "low";
   tags: string[];
+  /** V1.2：命中会话收获时展示的会话片段。 */
+  extraLines?: string[];
   onClick: () => void;
 }
 
@@ -205,6 +243,15 @@ function ResultSection({
                   {it.sub && <span>{it.sub}</span>}
                   <TagChips tags={it.tags} />
                 </div>
+                {it.extraLines && it.extraLines.length > 0 && (
+                  <div className="mt-1.5 space-y-0.5 border-t border-dashed border-gray-100 dark:border-slate-700 pt-1.5">
+                    {it.extraLines.map((line, i) => (
+                      <div key={i} className="truncate text-xs text-amber-700 dark:text-amber-300">
+                        {line}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
               <span className={`rounded border px-1.5 py-0.5 text-xs ${PRIORITY_BADGE[it.priority]}`}>
                 {PRIORITY_LABEL[it.priority]}

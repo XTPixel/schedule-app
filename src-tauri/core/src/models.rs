@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 /// 当前支持的数据版本（§5.7 版本迁移骨架）。数据版本与应用版本相互独立：
 /// v1 = MVP(0.1.0) / Phase1(0.2.0) / Phase2(0.3.0)；
 /// v2 = Phase3(0.4.0)；v3 = V3.0(0.5.0)：新增提醒分级配置；
-/// v4 = V3.1(1.0.0-rc.1) 与 1.0.0 正式版：标签颜色。
-pub const CURRENT_VERSION: u32 = 4;
+/// v4 = V3.1(1.0.0-rc.1) 及 1.0.x / 1.1.x：标签颜色；
+/// v5 = V1.2(1.2.0)：新增长期任务（long_tasks.json，独立文件）。
+pub const CURRENT_VERSION: u32 = 5;
 
 /// 默认逾期日常宽限小时数（§8.3，MVP 硬编码）。
 pub const DEFAULT_GRACE_HOURS: i64 = 4;
@@ -206,6 +207,71 @@ pub struct TasksFile {
     pub version: u32,
     #[serde(default)]
     pub tasks: Vec<Task>,
+}
+
+// ---------------------------------------------------------------------------
+// 长期任务 LongTask（V1.2 / §3）
+// ---------------------------------------------------------------------------
+
+/// 长期任务状态：仅手动结束落 `ended`；到期由查询层派生，不落库改写（D4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LongTaskStatus {
+    #[default]
+    Active,
+    Ended,
+}
+
+/// 一次投入会话（结束一次计时 = 一条记录）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LongTaskSession {
+    pub id: String,
+    /// 本次会话首次开始的绝对时刻（UTC Z）。
+    pub started_at: String,
+    pub ended_at: String,
+    /// 毫秒精确值；后端以 endedAt - startedAt 复核覆盖。
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LongTask {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// 计划开始 / 截止日期（本地纯日期 YYYY-MM-DD，D5）。
+    pub start_date: String,
+    pub due_date: String,
+    #[serde(default)]
+    pub status: LongTaskStatus,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub priority: Priority,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub deleted_at: Option<String>,
+    #[serde(default)]
+    pub sessions: Vec<LongTaskSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LongTasksFile {
+    pub version: u32,
+    #[serde(default)]
+    pub long_tasks: Vec<LongTask>,
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +651,7 @@ pub struct AppData {
     pub events: Vec<Event>,
     pub routines: Vec<Routine>,
     pub tasks: Vec<Task>,
+    pub long_tasks: Vec<LongTask>,
     pub config: Config,
     /// 当前月份的归档文件。
     pub archive: ArchiveFile,

@@ -11,9 +11,9 @@ use schedule_core::{
     apply_template, compute_candidates, compute_review, compute_stats, dispatch_hook, expand_events,
     list_hooks, new_template, new_template_item, parse_natural_language, preview_template, timeutil,
     ArchiveDay, ArchiveEntry, ArchiveFile, ArchiveSource, AppData, CalendarData, CalendarRoutineWindow,
-    CandidatesResult, Config, Event, HookInfo, HookRunResult, ItemStatus, NlpEvent, ReviewResult, Routine,
-    SearchQuery, SearchResult, StatsResult, Storage, Task, Template, TemplateApplyResult, TemplateKind,
-    TemplatePreview,
+    CandidatesResult, Config, Event, HookInfo, HookRunResult, ItemStatus, LongTask, LongTaskSession,
+    LongTaskStatus, NlpEvent, ReviewResult, Routine, SearchQuery, SearchResult, StatsResult, Storage,
+    Task, Template, TemplateApplyResult, TemplateKind, TemplatePreview,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -202,6 +202,195 @@ pub fn delete_task(id: String, state: State<AppState>) -> Result<(), String> {
         }
     }
     storage.save_tasks(&tasks).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 长期任务 CRUD / 会话（V1.2）
+// ---------------------------------------------------------------------------
+
+/// 校验长期任务：标题非空；startDate / dueDate 为合法本地日期且 dueDate ≥ startDate。
+fn validate_long_task(t: &LongTask) -> Result<(), String> {
+    if t.title.trim().is_empty() {
+        return Err("标题不能为空".to_string());
+    }
+    let start = timeutil::parse_date(&t.start_date).map_err(|e| format!("开始日期无效：{e}"))?;
+    let due = timeutil::parse_date(&t.due_date).map_err(|e| format!("截止日期无效：{e}"))?;
+    if due < start {
+        return Err("截止日期不能早于开始日期".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn save_long_task(task: LongTask, state: State<AppState>) -> Result<LongTask, String> {
+    validate_long_task(&task)?;
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let mut t = task;
+    if t.id.is_empty() {
+        t.id = schedule_core::id::new_id("lt");
+    }
+    let now = timeutil::now_utc_string();
+    if t.created_at.is_empty() {
+        t.created_at = now.clone();
+    }
+    t.updated_at = now.clone();
+    // 手动结束落 endedAt；active 的未结束任务不保留 endedAt。
+    match t.status {
+        LongTaskStatus::Ended => {
+            if t.ended_at.is_none() {
+                t.ended_at = Some(now.clone());
+            }
+        }
+        LongTaskStatus::Active => t.ended_at = None,
+    }
+    match tasks.iter_mut().find(|x| x.id == t.id) {
+        Some(existing) => *existing = t.clone(),
+        None => tasks.push(t.clone()),
+    }
+    storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    Ok(t)
+}
+
+#[tauri::command]
+pub fn delete_long_task(id: String, state: State<AppState>) -> Result<(), String> {
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let now = timeutil::now_utc_string();
+    for t in tasks.iter_mut() {
+        if t.id == id {
+            t.deleted_at = Some(now.clone());
+            t.updated_at = now.clone();
+        }
+    }
+    storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddLongTaskSessionInput {
+    pub task_id: String,
+    pub started_at: String,
+    pub ended_at: String,
+    #[serde(default)]
+    pub duration_ms: i64,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[tauri::command]
+pub fn add_long_task_session(input: AddLongTaskSessionInput, state: State<AppState>) -> Result<LongTaskSession, String> {
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let task = tasks
+        .iter_mut()
+        .find(|t| t.id == input.task_id && t.deleted_at.is_none())
+        .ok_or_else(|| "长期任务不存在或已删除".to_string())?;
+
+    let started = timeutil::normalize_to_utc(&input.started_at).map_err(|e| e.to_string())?;
+    let ended = timeutil::normalize_to_utc(&input.ended_at).map_err(|e| e.to_string())?;
+    // 前端提交的 durationMs 仅作参考；后端以两端时间差复核覆盖（防时钟漂移）。
+    let _frontend_duration_ms = input.duration_ms;
+    let started_utc = timeutil::parse_utc(&started).map_err(|e| e.to_string())?;
+    let ended_utc = timeutil::parse_utc(&ended).map_err(|e| e.to_string())?;
+    if ended_utc < started_utc {
+        return Err("结束时间不能早于开始时间".to_string());
+    }
+    // 后端以两端差值复核 durationMs（防前端时钟漂移）；上限 7 天防御时钟错误。
+    let duration_ms = (ended_utc - started_utc).num_milliseconds();
+    if duration_ms <= 0 {
+        return Err("本次用时过短，未记录会话".to_string());
+    }
+    if duration_ms > 7 * 24 * 60 * 60 * 1000 {
+        return Err("单次会话时长异常（超过 7 天），未记录".to_string());
+    }
+
+    let now = timeutil::now_utc_string();
+    let session = LongTaskSession {
+        id: schedule_core::id::new_id("s"),
+        started_at: started,
+        ended_at: ended,
+        duration_ms,
+        note: input.note.filter(|n| !n.trim().is_empty()),
+        created_at: now.clone(),
+        updated_at: now.clone(),
+        deleted_at: None,
+    };
+    task.sessions.push(session.clone());
+    task.updated_at = now;
+    storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    Ok(session)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateLongTaskSessionNoteInput {
+    pub task_id: String,
+    pub session_id: String,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[tauri::command]
+pub fn update_long_task_session_note(
+    input: UpdateLongTaskSessionNoteInput,
+    state: State<AppState>,
+) -> Result<LongTaskSession, String> {
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let task = tasks
+        .iter_mut()
+        .find(|t| t.id == input.task_id && t.deleted_at.is_none())
+        .ok_or_else(|| "长期任务不存在或已删除".to_string())?;
+    let session = task
+        .sessions
+        .iter_mut()
+        .find(|s| s.id == input.session_id && s.deleted_at.is_none())
+        .ok_or_else(|| "会话记录不存在或已删除".to_string())?;
+    session.note = input.note.filter(|n| !n.trim().is_empty());
+    session.updated_at = timeutil::now_utc_string();
+    task.updated_at = session.updated_at.clone();
+    let out = session.clone();
+    storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LongTaskSessionRef {
+    pub task_id: String,
+    pub session_id: String,
+}
+
+#[tauri::command]
+pub fn delete_long_task_session(input: LongTaskSessionRef, state: State<AppState>) -> Result<(), String> {
+    set_long_task_session_deleted(input, true, state)
+}
+
+#[tauri::command]
+pub fn undelete_long_task_session(input: LongTaskSessionRef, state: State<AppState>) -> Result<(), String> {
+    set_long_task_session_deleted(input, false, state)
+}
+
+fn set_long_task_session_deleted(input: LongTaskSessionRef, deleted: bool, state: State<AppState>) -> Result<(), String> {
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let task = tasks
+        .iter_mut()
+        .find(|t| t.id == input.task_id && t.deleted_at.is_none())
+        .ok_or_else(|| "长期任务不存在或已删除".to_string())?;
+    let session = task
+        .sessions
+        .iter_mut()
+        .find(|s| s.id == input.session_id)
+        .ok_or_else(|| "会话记录不存在".to_string())?;
+    let now = timeutil::now_utc_string();
+    session.deleted_at = if deleted { Some(now.clone()) } else { None };
+    session.updated_at = now.clone();
+    task.updated_at = now;
+    storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -487,7 +676,7 @@ pub fn get_stats(days: i64, state: State<AppState>) -> Result<StatsResult, Strin
     let archive = storage
         .load_archive_range(&month_of(&timeutil::fmt_date(&from)), &month_of(&timeutil::fmt_date(&to)))
         .map_err(|e| e.to_string())?;
-    Ok(compute_stats(&archive, &data.routines, &data.events, &data.tasks, from, to))
+    Ok(compute_stats(&archive, &data.routines, &data.events, &data.tasks, &data.long_tasks, &data.config.timezone, from, to))
 }
 
 /// `get_review(from, to)`：日/周复盘视图。
@@ -535,6 +724,13 @@ pub fn list_tags(state: State<AppState>) -> Result<Vec<TagInfo>, String> {
     for t in &data.tasks {
         if t.deleted_at.is_none() {
             for tag in &t.tags {
+                *map.entry(tag.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    for lt in &data.long_tasks {
+        if lt.deleted_at.is_none() {
+            for tag in &lt.tags {
                 *map.entry(tag.clone()).or_insert(0) += 1;
             }
         }
@@ -626,6 +822,20 @@ pub fn rename_tag(old: String, new: String, state: State<AppState>) -> Result<()
     if t_changed {
         storage.save_tasks(&tasks).map_err(|e| e.to_string())?;
     }
+
+    let mut long_tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let mut lt_changed = false;
+    for lt in long_tasks.iter_mut() {
+        for tag in lt.tags.iter_mut() {
+            if *tag == old {
+                *tag = new.clone();
+                lt_changed = true;
+            }
+        }
+    }
+    if lt_changed {
+        storage.save_long_tasks(&long_tasks).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -680,6 +890,19 @@ pub fn delete_tag(tag: String, state: State<AppState>) -> Result<(), String> {
     if t_changed {
         storage.save_tasks(&tasks).map_err(|e| e.to_string())?;
     }
+
+    let mut long_tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let mut lt_changed = false;
+    for lt in long_tasks.iter_mut() {
+        let before = lt.tags.len();
+        lt.tags.retain(|x| x != &tag);
+        if lt.tags.len() != before {
+            lt_changed = true;
+        }
+    }
+    if lt_changed {
+        storage.save_long_tasks(&long_tasks).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -687,7 +910,7 @@ pub fn delete_tag(tag: String, state: State<AppState>) -> Result<(), String> {
 // Phase 1：自定义数据目录 / 导入导出
 // ---------------------------------------------------------------------------
 
-const DATA_FILES: [&str; 5] = ["events.json", "routines.json", "tasks.json", "templates.json", "config.json"];
+const DATA_FILES: [&str; 6] = ["events.json", "routines.json", "tasks.json", "templates.json", "config.json", "long_tasks.json"];
 
 /// `pick_directory()`：原生文件夹选择（用于导入/导出/自定义数据目录）。
 #[tauri::command]
@@ -790,6 +1013,7 @@ pub struct ImportResult {
     pub events: usize,
     pub routines: usize,
     pub tasks: usize,
+    pub long_tasks: usize,
     pub archive_months: usize,
 }
 
@@ -810,6 +1034,7 @@ pub fn import_data(src_dir: String, state: State<AppState>) -> Result<ImportResu
     storage.save_events(&src_data.events).map_err(|e| e.to_string())?;
     storage.save_routines(&src_data.routines).map_err(|e| e.to_string())?;
     storage.save_tasks(&src_data.tasks).map_err(|e| e.to_string())?;
+    storage.save_long_tasks(&src_data.long_tasks).map_err(|e| e.to_string())?;
     let templates = src_storage.read_templates().map_err(|e| e.to_string())?;
     storage.save_templates(&templates).map_err(|e| e.to_string())?;
     storage.save_config(&config).map_err(|e| e.to_string())?;
@@ -838,6 +1063,7 @@ pub fn import_data(src_dir: String, state: State<AppState>) -> Result<ImportResu
         events: src_data.events.len(),
         routines: src_data.routines.len(),
         tasks: src_data.tasks.len(),
+        long_tasks: src_data.long_tasks.len(),
         archive_months: months,
     })
 }
@@ -1148,5 +1374,32 @@ mod tests {
         assert!(delete_tag_color(&mut colors, "工作"));
         assert!(colors.is_empty());
         assert!(!delete_tag_color(&mut colors, "工作"));
+    }
+
+    /// V1.2：长期任务日期区间校验。
+    #[test]
+    fn test_validate_long_task_rejects_invalid_dates() {
+        let base = LongTask {
+            id: "lt1".to_string(),
+            title: "备考".to_string(),
+            description: None,
+            start_date: "2025-03-01".to_string(),
+            due_date: "2025-03-31".to_string(),
+            status: LongTaskStatus::Active,
+            ended_at: None,
+            tags: vec![],
+            priority: schedule_core::Priority::Normal,
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+            sessions: vec![],
+        };
+        assert!(validate_long_task(&base).is_ok());
+        let mut inverted = base.clone();
+        inverted.due_date = "2025-02-01".to_string();
+        assert!(validate_long_task(&inverted).unwrap_err().contains("截止日期"));
+        let mut empty_title = base;
+        empty_title.title = "  ".to_string();
+        assert!(validate_long_task(&empty_title).unwrap_err().contains("标题"));
     }
 }

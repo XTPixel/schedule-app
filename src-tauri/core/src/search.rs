@@ -6,7 +6,7 @@
 use chrono::{Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{AppData, Event, Routine, Task};
+use crate::models::{AppData, Event, LongTask, Routine, Task};
 use crate::recurrence;
 use crate::timeutil;
 
@@ -28,6 +28,8 @@ pub struct SearchResult {
     pub events: Vec<Event>,
     pub tasks: Vec<Task>,
     pub routines: Vec<Routine>,
+    /// V1.2：长期任务（标题 / 描述 / 标签 / 会话收获命中，含完整 sessions）。
+    pub long_tasks: Vec<LongTask>,
 }
 
 pub fn search(data: &AppData, q: &SearchQuery) -> SearchResult {
@@ -63,7 +65,18 @@ pub fn search(data: &AppData, q: &SearchQuery) -> SearchResult {
         .cloned()
         .collect();
 
-    SearchResult { events, tasks, routines }
+    // V1.2：长期任务。文本命中范围 = 标题 / 描述 / 标签 / 有效会话收获；
+    // 日期筛选要求计划窗口与筛选区间存在交集。
+    let long_tasks = data
+        .long_tasks
+        .iter()
+        .filter(|t| t.deleted_at.is_none())
+        .filter(|t| long_task_matches(t, &text) && tags_match(&t.tags, &tags))
+        .filter(|t| long_task_in_range(t, from, to))
+        .cloned()
+        .collect();
+
+    SearchResult { events, tasks, routines, long_tasks }
 }
 
 fn title_matches(title: &str, text: &str) -> bool {
@@ -104,4 +117,142 @@ fn task_in_range(t: &Task, from: Option<NaiveDate>, to: Option<NaiveDate>, tz: &
         return true;
     };
     from.map_or(true, |x| d >= x) && to.map_or(true, |x| d <= x)
+}
+
+fn long_task_matches(t: &LongTask, text: &str) -> bool {
+    if text.is_empty() || title_matches(&t.title, text) {
+        return true;
+    }
+    if t.description.as_deref().map(|d| d.to_lowercase().contains(text)).unwrap_or(false) {
+        return true;
+    }
+    if t.tags.iter().any(|x| x.to_lowercase().contains(text)) {
+        return true;
+    }
+    t.sessions
+        .iter()
+        .filter(|s| s.deleted_at.is_none())
+        .any(|s| s.note.as_deref().map(|n| n.to_lowercase().contains(text)).unwrap_or(false))
+}
+
+fn long_task_in_range(t: &LongTask, from: Option<NaiveDate>, to: Option<NaiveDate>) -> bool {
+    if from.is_none() && to.is_none() {
+        return true;
+    }
+    let (Some(start), Some(due)) = (
+        timeutil::parse_date(&t.start_date).ok(),
+        timeutil::parse_date(&t.due_date).ok(),
+    ) else {
+        return false;
+    };
+    // 计划窗口 [startDate, dueDate] 与 [from, to] 存在交集。
+    if let Some(f) = from {
+        if due < f {
+            return false;
+        }
+    }
+    if let Some(t) = to {
+        if start > t {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{
+        ArchiveFile, Config, LongTaskSession, LongTaskStatus, Priority,
+    };
+
+    fn lt(
+        id: &str,
+        title: &str,
+        start_date: &str,
+        due_date: &str,
+        tags: Vec<&str>,
+        note: Option<&str>,
+        deleted: bool,
+    ) -> LongTask {
+        LongTask {
+            id: id.to_string(),
+            title: title.to_string(),
+            description: None,
+            start_date: start_date.to_string(),
+            due_date: due_date.to_string(),
+            status: LongTaskStatus::Active,
+            ended_at: None,
+            tags: tags.into_iter().map(|s| s.to_string()).collect(),
+            priority: Priority::Normal,
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: deleted.then(|| "2025-02-01T00:00:00Z".to_string()),
+            sessions: note
+                .map(|n| {
+                    vec![LongTaskSession {
+                        id: "s1".to_string(),
+                        started_at: "2025-02-15T09:00:00Z".to_string(),
+                        ended_at: "2025-02-15T10:00:00Z".to_string(),
+                        duration_ms: 3_600_000,
+                        note: Some(n.to_string()),
+                        created_at: String::new(),
+                        updated_at: String::new(),
+                        deleted_at: None,
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn data(long_tasks: Vec<LongTask>) -> AppData {
+        AppData {
+            events: vec![],
+            routines: vec![],
+            tasks: vec![],
+            long_tasks,
+            config: Config::default(),
+            archive: ArchiveFile {
+                version: crate::models::CURRENT_VERSION,
+                month: "2025-02".to_string(),
+                days: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_search_long_tasks_by_title_tags_note_and_range() {
+        let d = data(vec![
+            lt("lt1", "雅思备考", "2025-01-01", "2025-06-30", vec!["学习"], Some("听力精听两篇"), false),
+            lt("lt2", "健身计划", "2025-03-01", "2025-12-31", vec![], None, false),
+        ]);
+
+        let hit_by_title = search(&d, &SearchQuery { text: "雅思".to_string(), ..Default::default() });
+        assert_eq!(hit_by_title.long_tasks.len(), 1);
+
+        let hit_by_tag = search(&d, &SearchQuery { text: String::new(), tags: vec!["学习".to_string()], ..Default::default() });
+        assert_eq!(hit_by_tag.long_tasks.len(), 1);
+
+        let hit_by_note = search(&d, &SearchQuery { text: "精听".to_string(), ..Default::default() });
+        assert_eq!(hit_by_note.long_tasks.len(), 1);
+
+        let hit_by_range = search(
+            &d,
+            &SearchQuery {
+                text: String::new(),
+                date_from: Some("2025-01-01".to_string()),
+                date_to: Some("2025-01-31".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(hit_by_range.long_tasks.len(), 1);
+        assert_eq!(hit_by_range.long_tasks[0].id, "lt1");
+    }
+
+    #[test]
+    fn test_search_excludes_deleted_long_tasks() {
+        let d = data(vec![lt("lt1", "已删除任务", "2025-01-01", "2025-12-31", vec![], None, true)]);
+        let r = search(&d, &SearchQuery { text: "任务".to_string(), ..Default::default() });
+        assert!(r.long_tasks.is_empty());
+    }
 }

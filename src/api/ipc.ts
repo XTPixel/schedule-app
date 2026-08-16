@@ -12,6 +12,8 @@ import type {
   HookRunResult,
   HooksStatus,
   ImportResult,
+  LongTask,
+  LongTaskSession,
   NlpEvent,
   ReviewResult,
   Routine,
@@ -42,6 +44,36 @@ export const deleteRoutine = (id: string) => invoke<void>("delete_routine", { id
 export const saveTask = (task: Task) => invoke<Task>("save_task", { task });
 
 export const deleteTask = (id: string) => invoke<void>("delete_task", { id });
+
+// ---- V1.2：长期任务与会话 ----
+
+export const saveLongTask = (task: LongTask) =>
+  invoke<LongTask>("save_long_task", { task });
+
+export const deleteLongTask = (id: string) => invoke<void>("delete_long_task", { id });
+
+export interface AddLongTaskSessionInput {
+  taskId: string;
+  startedAt: string;
+  endedAt: string;
+  durationMs: number;
+  note?: string | null;
+}
+
+export const addLongTaskSession = (input: AddLongTaskSessionInput) =>
+  invoke<LongTaskSession>("add_long_task_session", { input });
+
+export const updateLongTaskSessionNote = (
+  taskId: string,
+  sessionId: string,
+  note: string | null,
+) => invoke<LongTaskSession>("update_long_task_session_note", { input: { taskId, sessionId, note } });
+
+export const deleteLongTaskSession = (taskId: string, sessionId: string) =>
+  invoke<void>("delete_long_task_session", { input: { taskId, sessionId } });
+
+export const undeleteLongTaskSession = (taskId: string, sessionId: string) =>
+  invoke<void>("undelete_long_task_session", { input: { taskId, sessionId } });
 
 export const archiveEntry = (entry: ArchiveEntry) =>
   invoke<ArchiveEntry>("archive_entry", { entry });

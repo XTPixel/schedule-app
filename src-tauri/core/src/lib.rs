@@ -39,7 +39,7 @@ pub use nlp::{parse_natural_language, NlpEvent};
 pub use recurrence::{expand_events, CalendarData, CalendarRoutineWindow, Occurrence};
 pub use search::{search, SearchQuery, SearchResult};
 pub use stats::{
-    compute_review, compute_stats, DayCount, ReviewDay, ReviewResult, RoutineCompletion, StatsResult,
-    StatsTotals, TagDuration,
+    compute_review, compute_stats, DayCount, LongTaskStatItem, ReviewDay, ReviewResult,
+    RoutineCompletion, StatsResult, StatsTotals, TagDuration,
 };
 pub use storage::{MtimeStatus, Storage};

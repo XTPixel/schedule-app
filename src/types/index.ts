@@ -4,6 +4,9 @@ export type Priority = "high" | "normal" | "low";
 export type ItemStatus = "active" | "completed" | "cancelled";
 export type ArchiveSource = "event" | "routine" | "task" | "manual";
 export type CandidateSource = "event" | "routine" | "task";
+/** V1.2：计时器来源包含长期任务（但长期任务不进入候选引擎）。 */
+export type TimerSourceType = CandidateSource | "longtask";
+export type LongTaskStatus = "active" | "ended";
 
 export interface Reminder {
   offsetMinutes: number;
@@ -68,6 +71,35 @@ export interface Task {
   updatedAt: string;
   completedAt: string | null;
   deletedAt: string | null;
+}
+
+// ---- V1.2：长期任务 ----
+
+export interface LongTaskSession {
+  id: string;
+  startedAt: string; // 绝对时刻（UTC Z），本次会话首次开始
+  endedAt: string; // 绝对时刻（UTC Z）
+  durationMs: number;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+}
+
+export interface LongTask {
+  id: string;
+  title: string;
+  description: string | null;
+  startDate: string; // YYYY-MM-DD
+  dueDate: string; // YYYY-MM-DD
+  status: LongTaskStatus;
+  endedAt: string | null;
+  tags: string[];
+  priority: Priority;
+  createdAt: string;
+  updatedAt: string;
+  deletedAt: string | null;
+  sessions: LongTaskSession[];
 }
 
 export interface ArchiveEntry {
@@ -186,6 +218,7 @@ export interface AppData {
   events: Event[];
   routines: Routine[];
   tasks: Task[];
+  longTasks: LongTask[];
   config: Config;
   archive: ArchiveFile; // 当前月份归档
 }
@@ -251,6 +284,7 @@ export interface SearchResult {
   events: Event[];
   tasks: Task[];
   routines: Routine[];
+  longTasks: LongTask[];
 }
 
 export interface DayCount {
@@ -279,6 +313,14 @@ export interface StatsTotals {
   activeDays: number;
 }
 
+/** V1.2：长期任务投入统计项（独立口径，不计入 totals）。 */
+export interface LongTaskStatItem {
+  taskId: string;
+  title: string;
+  count: number;
+  durationMinutes: number;
+}
+
 export interface StatsResult {
   from: string;
   to: string;
@@ -286,6 +328,7 @@ export interface StatsResult {
   tagDurations: TagDuration[];
   routineCompletion: RoutineCompletion[];
   totals: StatsTotals;
+  longTaskStats: LongTaskStatItem[];
 }
 
 export interface ReviewDay {
@@ -316,6 +359,7 @@ export interface ImportResult {
   events: number;
   routines: number;
   tasks: number;
+  longTasks: number;
   archiveMonths: number;
 }
 

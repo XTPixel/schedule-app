@@ -1,12 +1,15 @@
 import { useState } from "react";
+import dayjs from "dayjs";
 import { useAppStore } from "../store/useAppStore";
 import { fmtDate, fmtTime, buildLocalIso, todayInTz } from "../lib/time";
+import { computeLongTaskStats, fmtDurationMs } from "../lib/longTaskStats";
 import { TimeField } from "./TimeField";
 import { TagInput } from "./TagInput";
+import { InlineEdit } from "./InlineEdit";
 import { WEEKDAY_LABEL } from "../lib/format";
-import type { Event, Reminder, Repeat, Routine, Task, TimeWindow } from "../types";
+import type { Event, LongTask, LongTaskSession, Reminder, Repeat, Routine, Task, TimeWindow } from "../types";
 
-const KIND_LABEL = { event: "事件", routine: "日常", task: "浮动事项" } as const;
+const KIND_LABEL = { event: "事件", routine: "日常", task: "浮动事项", longtask: "长期任务" } as const;
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -207,6 +210,10 @@ export function Drawer() {
   const deleteEvent = useAppStore((s) => s.deleteEvent);
   const deleteRoutine = useAppStore((s) => s.deleteRoutine);
   const deleteTask = useAppStore((s) => s.deleteTask);
+  const deleteLongTask = useAppStore((s) => s.deleteLongTask);
+  const endLongTask = useAppStore((s) => s.endLongTask);
+  const updateLongTaskSessionNote = useAppStore((s) => s.updateLongTaskSessionNote);
+  const deleteLongTaskSession = useAppStore((s) => s.deleteLongTaskSession);
 
   if (!drawer) return null;
   const { kind, draft, isNew } = drawer;
@@ -218,6 +225,7 @@ export function Drawer() {
     askConfirm(`删除${KIND_LABEL[kind]}`, `确定删除「${title}」吗？此操作可撤回。`, () => {
       if (kind === "event") void deleteEvent(id);
       else if (kind === "routine") void deleteRoutine(id);
+      else if (kind === "longtask") void deleteLongTask(id);
       else void deleteTask(id);
       closeDrawer();
     });
@@ -272,6 +280,7 @@ export function Drawer() {
         {kind === "event" && <EventFields draft={draft as Event} tz={tz} updateDraft={updateDraft} />}
         {kind === "routine" && <RoutineFields draft={draft as Routine} updateDraft={updateDraft} />}
         {kind === "task" && <TaskFields draft={draft as Task} tz={tz} updateDraft={updateDraft} />}
+        {kind === "longtask" && <LongTaskFields draft={draft as LongTask} updateDraft={updateDraft} />}
 
         <Field label="标签">
           <TagsField
@@ -286,6 +295,16 @@ export function Drawer() {
             onSave={(priority) => updateDraft({ priority } as never)}
           />
         </Field>
+
+        {kind === "longtask" && !isNew && (
+          <LongTaskDetailSection
+            task={draft as LongTask}
+            endLongTask={endLongTask}
+            askConfirm={askConfirm}
+            updateLongTaskSessionNote={updateLongTaskSessionNote}
+            deleteLongTaskSession={deleteLongTaskSession}
+          />
+        )}
       </div>
 
       {/* V3.1 U5：底部固定操作栏，显式「取消 / 保存」。 */}
@@ -524,5 +543,165 @@ function TaskFields({
         )}
       </div>
     </Field>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// V1.2：长期任务字段与详情
+// ---------------------------------------------------------------------------
+
+function LongTaskFields({
+  draft,
+  updateDraft,
+}: {
+  draft: LongTask;
+  updateDraft: (p: never) => void;
+}) {
+  return (
+    <>
+      <Field label="计划开始日期">
+        <input
+          type="date"
+          className={inputCls}
+          value={draft.startDate}
+          onChange={(e) => updateDraft({ startDate: e.target.value } as never)}
+        />
+      </Field>
+      <Field label="截止日期">
+        <input
+          type="date"
+          className={inputCls}
+          value={draft.dueDate}
+          onChange={(e) => updateDraft({ dueDate: e.target.value } as never)}
+        />
+      </Field>
+    </>
+  );
+}
+
+function LongTaskDetailSection({
+  task,
+  endLongTask,
+  askConfirm,
+  updateLongTaskSessionNote,
+  deleteLongTaskSession,
+}: {
+  task: LongTask;
+  endLongTask: (t: LongTask) => Promise<void>;
+  askConfirm: ReturnType<typeof useAppStore.getState>["askConfirm"];
+  updateLongTaskSessionNote: (taskId: string, sessionId: string, note: string | null) => Promise<void>;
+  deleteLongTaskSession: (taskId: string, sessionId: string) => Promise<void>;
+}) {
+  const tz = useAppStore((s) => s.data?.config.timezone ?? "Asia/Shanghai");
+  const today = todayInTz(tz);
+  const stats = computeLongTaskStats(task, today, tz);
+  const sessions = task.sessions
+    .filter((s) => s.deletedAt == null)
+    .slice()
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+
+  return (
+    <div className="mb-4 border-t border-gray-100 dark:border-slate-700 pt-4">
+      <div className="mb-3 grid grid-cols-3 gap-2">
+        <MiniStat label="今日次数" value={`${stats.todayCount}`} />
+        <MiniStat label="今日时长" value={fmtDurationMs(stats.todayDurationMs)} />
+        <MiniStat label="累计次数" value={`${stats.sessionCount}`} />
+        <MiniStat label="累计时长" value={fmtDurationMs(stats.totalDurationMs)} />
+        <MiniStat label="平均每次" value={stats.sessionCount ? fmtDurationMs(stats.avgDurationMs) : "—"} />
+        <MiniStat label="最后投入" value={stats.lastSessionAt ? dayjs(stats.lastSessionAt).format("MM-DD") : "—"} />
+      </div>
+
+      <div className="mb-4">
+        <h3 className="mb-2 text-xs font-semibold text-gray-500 dark:text-slate-400">投入记录（新 → 旧）</h3>
+        {sessions.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-gray-200 dark:border-slate-600 px-3 py-4 text-center text-xs text-gray-400 dark:text-slate-500">
+            还没有投入记录
+          </div>
+        ) : (
+          <ol className="space-y-2">
+            {sessions.map((s) => (
+              <LongTaskSessionRow
+                key={s.id}
+                session={s}
+                dueDate={task.dueDate}
+                onSaveNote={(note) => updateLongTaskSessionNote(task.id, s.id, note)}
+                onDelete={() => {
+                  askConfirm("删除本次记录", "确定删除这条投入记录吗？删除后可从 Toast 撤回。", () => {
+                    void deleteLongTaskSession(task.id, s.id);
+                  });
+                }}
+              />
+            ))}
+          </ol>
+        )}
+      </div>
+
+      {task.status === "active" && (
+        <button
+          type="button"
+          className="w-full rounded-lg border border-red-200 dark:border-red-900 px-3 py-2 text-sm text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20"
+          onClick={() => {
+            askConfirm(
+              "结束长期任务",
+              "结束后该任务不再出现在「现在」页，历史投入记录会保留。确定结束吗？",
+              () => void endLongTask(task),
+              undefined,
+              "结束任务",
+              "取消",
+            );
+          }}
+        >
+          结束长期任务
+        </button>
+      )}
+    </div>
+  );
+}
+
+function MiniStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-lg bg-gray-50 dark:bg-slate-700/40 px-2 py-2 text-center">
+      <div className="text-[10px] text-gray-400 dark:text-slate-500">{label}</div>
+      <div className="mt-0.5 text-xs font-semibold tabular-nums text-gray-700 dark:text-slate-200">{value}</div>
+    </div>
+  );
+}
+
+function LongTaskSessionRow({
+  session,
+  dueDate,
+  onSaveNote,
+  onDelete,
+}: {
+  session: LongTaskSession;
+  dueDate: string;
+  onSaveNote: (note: string | null) => void;
+  onDelete: () => void;
+}) {
+  const crossDue = dayjs(session.endedAt).format("YYYY-MM-DD") > dueDate;
+  return (
+    <li className="rounded-lg border border-gray-100 dark:border-slate-700 px-3 py-2">
+      <div className="flex items-center gap-2 text-xs text-gray-500 dark:text-slate-400">
+        <span className="tabular-nums">{dayjs(session.startedAt).format("MM-DD HH:mm")}</span>
+        <span>→</span>
+        <span className="tabular-nums">{dayjs(session.endedAt).format("HH:mm")}</span>
+        {crossDue && (
+          <span className="rounded bg-red-50 dark:bg-red-900/30 px-1 py-0.5 text-red-500">跨截止</span>
+        )}
+        <span className="ml-auto font-medium text-gray-700 dark:text-slate-200">{fmtDurationMs(session.durationMs)}</span>
+        <button type="button" className="text-red-400 hover:text-red-600" onClick={onDelete}>
+          删除
+        </button>
+      </div>
+      <div className="mt-1 text-xs text-gray-600 dark:text-slate-300">
+        <InlineEdit
+          value={session.note ?? ""}
+          placeholder="补填本次收获（可选）"
+          className="!rounded px-1 py-0.5 text-xs"
+          textClassName="text-gray-400 dark:text-slate-500"
+          onSave={(v) => onSaveNote(v.trim() || null)}
+        />
+      </div>
+    </li>
   );
 }

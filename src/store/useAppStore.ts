@@ -18,6 +18,8 @@ import type {
   Config,
   Event,
   ImportResult,
+  LongTask,
+  LongTaskSession,
   ReviewResult,
   Routine,
   SearchQuery,
@@ -25,6 +27,7 @@ import type {
   StatsResult,
   TagInfo,
   Task,
+  TimerSourceType,
 } from "../types";
 
 export type Page =
@@ -33,12 +36,14 @@ export type Page =
   | "events"
   | "routines"
   | "tasks"
+  | "longtasks"
   | "search"
   | "archive"
   | "stats"
   | "settings"
   | "extensions";
-export type DrawerKind = "event" | "routine" | "task";
+export type DrawerKind = "event" | "routine" | "task" | "longtask";
+export type DraftEntity = Event | Routine | Task | LongTask;
 
 export interface Toast {
   id: string;
@@ -59,19 +64,21 @@ export interface ConfirmState {
 
 export interface DrawerState {
   kind: DrawerKind;
-  draft: Event | Routine | Task;
+  draft: DraftEntity;
   isNew: boolean;
   /** 打开抽屉时的初始快照，用于「有未保存改动」判断（V3.1 U5）。 */
-  initial: Event | Routine | Task;
+  initial: DraftEntity;
 }
 
 /** V3.0 F1：事项计时器状态（单计时器，localStorage 持久化）。 */
 export interface TimerState {
-  sourceType: CandidateSource;
+  sourceType: TimerSourceType;
   title: string;
   startedAt: number; // 本次开始/继续的 epoch 毫秒
   accumulatedMs: number; // 本次开始前累计毫秒
   running: boolean;
+  /** V1.2：长期任务本次会话首次开始时间戳（继续/暂停不覆盖）。 */
+  sessionStartedAt?: number;
 }
 
 interface SnoozeEntry {
@@ -91,6 +98,16 @@ function localDateKey(): string {
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+/** YYYY-MM-DD + n 天（纯日期，避免时区偏移）。 */
+function addDays(date: string, n: number): string {
+  const [y, m, d] = date.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + n));
+  const yy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  return `${yy}-${mm}-${dd}`;
 }
 
 function loadJSON<T>(key: string, fallback: T): T {
@@ -210,8 +227,8 @@ interface AppStore {
   refresh: () => Promise<void>;
   setPage: (p: Page) => void;
 
-  openDrawer: (kind: DrawerKind, obj: Event | Routine | Task | null) => void;
-  updateDraft: (patch: Partial<Event | Routine | Task>) => void;
+  openDrawer: (kind: DrawerKind, obj: DraftEntity | null) => void;
+  updateDraft: (patch: Partial<DraftEntity>) => void;
   /** 仅落盘草稿（不关闭），成功返回 true；供 saveDraftAndClose 与既有调用方使用。 */
   saveDraft: () => Promise<boolean>;
   /** V3.1 U5：校验必填 → 保存 → 成功后关闭并 Toast；失败留在抽屉。 */
@@ -219,6 +236,8 @@ interface AppStore {
   /** V3.1 U5：✕ / 取消的统一入口：有未保存改动先确认，无改动直接关闭。 */
   requestCloseDrawer: () => void;
   closeDrawer: () => void;
+  /** V1.2：会话变更后，用最新 data 同步长期任务抽屉草稿。 */
+  syncLongTaskDrawer: (taskId: string) => void;
 
   pushToast: (message: string, actionLabel?: string, onAction?: () => void) => void;
   dismissToast: (id: string) => void;
@@ -239,6 +258,13 @@ interface AppStore {
   toggleTimer: (sourceType: CandidateSource, sourceId: string, title: string) => void;
   pauseTimer: (sourceId: string) => void;
   timerElapsedMs: (sourceId: string) => number;
+  /** V1.2：长期任务计时（单计时器互斥；写入 sessionStartedAt）。 */
+  startLongTaskTimer: (task: LongTask) => void;
+  toggleLongTaskTimer: (task: LongTask) => void;
+  /** V1.2：终止本次投入 → 落库会话 + 清计时 + 撤回 Toast；失败保留计时。 */
+  terminateLongTaskSession: (task: LongTask) => Promise<LongTaskSession | null>;
+  /** V1.2：丢弃任务计时状态（删除任务时调用；不记录会话）。 */
+  dropTimer: (sourceId: string) => void;
 
   // V3.0 F2：跳过/稍后（含撤回）。
   skipCandidate: (id: string) => void;
@@ -254,6 +280,14 @@ interface AppStore {
   saveTask: (t: Task) => Promise<Task>;
   deleteTask: (id: string) => Promise<void>;
   updateTaskOrder: (orderedIds: string[]) => Promise<void>;
+
+  // V1.2：长期任务。
+  saveLongTask: (t: LongTask) => Promise<LongTask>;
+  deleteLongTask: (id: string) => Promise<void>;
+  endLongTask: (t: LongTask) => Promise<void>;
+  updateLongTaskSessionNote: (taskId: string, sessionId: string, note: string | null) => Promise<void>;
+  deleteLongTaskSession: (taskId: string, sessionId: string) => Promise<void>;
+  undeleteLongTaskSession: (taskId: string, sessionId: string) => Promise<void>;
 
   completeCandidate: (
     sourceType: CandidateSource,
@@ -365,7 +399,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const todayDate = todayInTz(tz);
     const nowLocal = nowHhmmInTz(tz);
     const startTime = nowPlusOneHourLocal(todayDate, nowLocal, tz);
-    let draft: Event | Routine | Task;
+    let draft: DraftEntity;
     if (kind === "event") {
       draft = {
         id: "",
@@ -398,6 +432,23 @@ export const useAppStore = create<AppStore>((set, get) => ({
         updatedAt: "",
         deletedAt: null,
       };
+    } else if (kind === "longtask") {
+      // V1.2：默认计划窗口 = 今天起 30 天。
+      draft = {
+        id: "",
+        title: "",
+        description: null,
+        startDate: todayDate,
+        dueDate: addDays(todayDate, 30),
+        status: "active",
+        endedAt: null,
+        tags: [],
+        priority: "normal",
+        createdAt: "",
+        updatedAt: "",
+        deletedAt: null,
+        sessions: [],
+      };
     } else {
       draft = {
         id: "",
@@ -420,18 +471,20 @@ export const useAppStore = create<AppStore>((set, get) => ({
   updateDraft(patch) {
     const drawer = get().drawer;
     if (!drawer) return;
-    set({ drawer: { ...drawer, draft: { ...drawer.draft, ...patch } as Event | Routine | Task } });
+    set({ drawer: { ...drawer, draft: { ...drawer.draft, ...patch } as DraftEntity } });
   },
 
   async saveDraft() {
     const drawer = get().drawer;
     if (!drawer) return false;
     try {
-      let saved: Event | Routine | Task | null;
+      let saved: DraftEntity | null;
       if (drawer.kind === "event") {
         saved = await withExternalConflict(() => api.saveEvent(drawer.draft as Event));
       } else if (drawer.kind === "routine") {
         saved = await withExternalConflict(() => api.saveRoutine(drawer.draft as Routine));
+      } else if (drawer.kind === "longtask") {
+        saved = await withExternalConflict(() => api.saveLongTask(drawer.draft as LongTask));
       } else {
         saved = await withExternalConflict(() => api.saveTask(drawer.draft as Task));
       }
@@ -456,6 +509,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (!title) {
       get().pushToast("标题不能为空");
       return;
+    }
+    if (drawer.kind === "longtask") {
+      const lt = drawer.draft as LongTask;
+      if (!lt.startDate || !lt.dueDate) {
+        get().pushToast("请填写开始日期与截止日期");
+        return;
+      }
+      if (lt.dueDate < lt.startDate) {
+        get().pushToast("截止日期不能早于开始日期");
+        return;
+      }
     }
     if (get().savingDrawer) return;
     set({ savingDrawer: true });
@@ -484,6 +548,20 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   closeDrawer() {
     set({ drawer: null, savingDrawer: false });
+  },
+
+  syncLongTaskDrawer(taskId) {
+    const drawer = get().drawer;
+    if (!drawer || drawer.kind !== "longtask") return;
+    const fresh = get().data?.longTasks.find((x) => x.id === taskId);
+    if (!fresh) return;
+    set({
+      drawer: {
+        ...drawer,
+        draft: structuredClone(fresh),
+        initial: { ...structuredClone(fresh), sessions: structuredClone(fresh.sessions) },
+      },
+    });
   },
 
   pushToast(message, actionLabel, onAction) {
@@ -547,6 +625,81 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const t = get().timers[sourceId];
     if (!t) return 0;
     return t.accumulatedMs + (t.running ? Date.now() - t.startedAt : 0);
+  },
+
+  // ---- V1.2：长期任务计时 / 会话 ----
+
+  startLongTaskTimer(task) {
+    const now = Date.now();
+    const timers = { ...get().timers };
+    // 单计时器互斥：暂停其它 running 计时。
+    for (const [id, t] of Object.entries(timers)) {
+      if (t.running) {
+        timers[id] = { ...t, running: false, accumulatedMs: t.accumulatedMs + (now - t.startedAt), startedAt: 0 };
+      }
+    }
+    const existing = timers[task.id];
+    const sessionStartedAt =
+      existing?.sessionStartedAt ?? (existing && existing.startedAt > 0 ? existing.startedAt : now);
+    timers[task.id] = {
+      sourceType: "longtask",
+      title: task.title,
+      startedAt: now,
+      accumulatedMs: existing?.accumulatedMs ?? 0,
+      running: true,
+      sessionStartedAt,
+    };
+    set({ timers });
+    saveJSON(TIMER_KEY, timers);
+  },
+
+  toggleLongTaskTimer(task) {
+    const t = get().timers[task.id];
+    if (t && t.running) {
+      get().pauseTimer(task.id);
+    } else {
+      get().startLongTaskTimer(task);
+    }
+  },
+
+  async terminateLongTaskSession(task) {
+    const timer = get().timers[task.id];
+    if (!timer) return null;
+    const elapsedMs = Math.max(0, timer.accumulatedMs + (timer.running ? Date.now() - timer.startedAt : 0));
+    const sessionStart =
+      timer.sessionStartedAt ?? (timer.startedAt > 0 ? timer.startedAt : Date.now() - elapsedMs);
+    try {
+      const session = await withExternalConflict(() =>
+        api.addLongTaskSession({
+          taskId: task.id,
+          startedAt: new Date(sessionStart).toISOString(),
+          endedAt: new Date().toISOString(),
+          durationMs: elapsedMs,
+          note: null,
+        }),
+      );
+      if (session === null) return null;
+      // 成功落库后才清除计时（失败保留计时可重试）。
+      get().dropTimer(task.id);
+      await get().refresh();
+      get().pushToast(`已记录本次投入「${task.title || "长期任务"}」`, "撤回", async () => {
+        await withExternalConflict(() => api.deleteLongTaskSession(task.id, session.id));
+        await get().refresh();
+        get().syncLongTaskDrawer(task.id);
+      });
+      return session;
+    } catch (e) {
+      setError(`记录投入失败：${String(e)}`);
+      return null;
+    }
+  },
+
+  dropTimer(sourceId) {
+    const timers = { ...get().timers };
+    if (!timers[sourceId]) return;
+    delete timers[sourceId];
+    set({ timers });
+    saveJSON(TIMER_KEY, timers);
   },
 
   // ---- V3.0 F2：跳过/稍后 ----
@@ -683,6 +836,96 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const r = await withExternalConflict(() => Promise.all(updates.map((t) => api.saveTask(t))));
     if (r === null) return;
     await get().refresh();
+  },
+
+  // ---- V1.2：长期任务 CRUD / 会话 ----
+
+  async saveLongTask(t) {
+    try {
+      const saved = await withExternalConflict(() => api.saveLongTask(t));
+      if (saved === null) return t;
+      await get().refresh();
+      return saved;
+    } catch (e) {
+      setError(`保存长期任务失败：${String(e)}`);
+      return t;
+    }
+  },
+
+  async deleteLongTask(id) {
+    try {
+      const original = get().data?.longTasks.find((x) => x.id === id);
+      // 删除前丢弃进行中的计时（不记录会话，且撤回不恢复计时）。
+      const hadTimer = Boolean(get().timers[id]);
+      if (hadTimer) get().dropTimer(id);
+      const r = await withExternalConflict(() => api.deleteLongTask(id));
+      if (r === null) return;
+      await get().refresh();
+      if (original) {
+        const msg = hadTimer
+          ? `已删除「${original.title || "长期任务"}」（进行中的计时已丢弃）`
+          : `已删除「${original.title || "长期任务"}」`;
+        get().pushToast(msg, "撤回", async () => {
+          await withExternalConflict(() => api.saveLongTask(original));
+          await get().refresh();
+        });
+      }
+    } catch (e) {
+      setError(`删除长期任务失败：${String(e)}`);
+    }
+  },
+
+  async endLongTask(t) {
+    try {
+      const saved = await withExternalConflict(() =>
+        api.saveLongTask({ ...t, status: "ended", endedAt: null }),
+      );
+      if (saved === null) return;
+      await get().refresh();
+      get().syncLongTaskDrawer(t.id);
+    } catch (e) {
+      setError(`结束长期任务失败：${String(e)}`);
+    }
+  },
+
+  async updateLongTaskSessionNote(taskId, sessionId, note) {
+    try {
+      const saved = await withExternalConflict(() => api.updateLongTaskSessionNote(taskId, sessionId, note));
+      if (saved === null) return;
+      await get().refresh();
+      get().syncLongTaskDrawer(taskId);
+    } catch (e) {
+      setError(`保存收获失败：${String(e)}`);
+    }
+  },
+
+  async deleteLongTaskSession(taskId, sessionId) {
+    try {
+      const task = get().data?.longTasks.find((x) => x.id === taskId);
+      const session = task?.sessions.find((s) => s.id === sessionId);
+      const r = await withExternalConflict(() => api.deleteLongTaskSession(taskId, sessionId));
+      if (r === null) return;
+      await get().refresh();
+      get().syncLongTaskDrawer(taskId);
+      if (session) {
+        get().pushToast("已删除本次投入记录", "撤回", async () => {
+          await get().undeleteLongTaskSession(taskId, sessionId);
+        });
+      }
+    } catch (e) {
+      setError(`删除投入记录失败：${String(e)}`);
+    }
+  },
+
+  async undeleteLongTaskSession(taskId, sessionId) {
+    try {
+      const r = await withExternalConflict(() => api.undeleteLongTaskSession(taskId, sessionId));
+      if (r === null) return;
+      await get().refresh();
+      get().syncLongTaskDrawer(taskId);
+    } catch (e) {
+      setError(`撤回投入记录失败：${String(e)}`);
+    }
   },
 
   async completeCandidate(sourceType, sourceId, seriesId, title, suggestedDurationMinutes) {
@@ -867,7 +1110,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   async importData(srcDir) {
     const result = await withExternalConflict(() => api.importData(srcDir));
-    if (result === null) return { events: 0, routines: 0, tasks: 0, archiveMonths: 0 };
+    if (result === null) return { events: 0, routines: 0, tasks: 0, longTasks: 0, archiveMonths: 0 };
     await get().refresh();
     return result;
   },

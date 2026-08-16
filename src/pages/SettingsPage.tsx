@@ -148,7 +148,7 @@ export function SettingsPage() {
     setImporting(true);
     try {
       const r = await importData(dir);
-      pushToast(`已导入：事件 ${r.events}、日常 ${r.routines}、浮动 ${r.tasks}、归档 ${r.archiveMonths} 个月`);
+      pushToast(`已导入：事件 ${r.events}、日常 ${r.routines}、浮动 ${r.tasks}、长期 ${r.longTasks}、归档 ${r.archiveMonths} 个月`);
     } catch (e) {
       pushToast(`导入失败：${String(e)}`);
     } finally {

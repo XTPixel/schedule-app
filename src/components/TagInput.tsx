@@ -8,12 +8,11 @@ interface Props {
   onBlur?: () => void;
 }
 
-/** 标签输入（V3.0 F4）：芯片列表 + 输入框；聚焦时提示已有标签候选，可新建标签。V3.1 应用标签颜色。 */
+/** 标签输入（V3.0 F4 / v1.1.0）：芯片列表 + 输入框；已有标签候选始终直接显示，可点击选择，也可输入新建。V3.1 应用标签颜色。 */
 export function TagInput({ value, onChange, onBlur }: Props) {
   const tags = useAppStore((s) => s.tags);
   const tagColors = useAppStore((s) => s.data?.config.tagColors ?? {});
   const [text, setText] = useState("");
-  const [focused, setFocused] = useState(false);
 
   const suggestions = useMemo(() => {
     const q = text.trim().toLowerCase();
@@ -64,11 +63,9 @@ export function TagInput({ value, onChange, onBlur }: Props) {
         ))}
         <input
           className="min-w-24 flex-1 border-0 bg-transparent px-1 py-0.5 text-sm text-gray-800 dark:text-slate-100 outline-none placeholder:text-gray-400 dark:placeholder:text-slate-500"
-          placeholder="输入标签，回车/逗号添加"
+          placeholder="输入标签，回车/逗号添加，或点选下方已有标签"
           value={text}
-          onFocus={() => setFocused(true)}
           onBlur={() => {
-            setFocused(false);
             // 先把未确认文本落成标签，再通知外层（此时外层能读到最新 tags）。
             commitPending();
             onBlur?.();
@@ -86,8 +83,9 @@ export function TagInput({ value, onChange, onBlur }: Props) {
           }}
         />
       </div>
-      {focused && suggestions.length > 0 && (
-        <div className="mt-1 flex flex-wrap gap-1">
+      {suggestions.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1">
+          <span className="text-xs text-gray-400 dark:text-slate-500">已有标签</span>
           {suggestions.map((t) => (
             <button
               key={t}

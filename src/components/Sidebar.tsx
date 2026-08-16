@@ -6,6 +6,7 @@ const NAV: { key: Page; label: string; icon: string }[] = [
   { key: "events", label: "事件", icon: "◷" },
   { key: "routines", label: "日常", icon: "↻" },
   { key: "tasks", label: "浮动", icon: "☰" },
+  { key: "longtasks", label: "长期", icon: "◈" },
   { key: "search", label: "搜索", icon: "⌕" },
   { key: "archive", label: "归档", icon: "▤" },
   { key: "stats", label: "统计", icon: "◫" },
@@ -13,7 +14,7 @@ const NAV: { key: Page; label: string; icon: string }[] = [
   { key: "settings", label: "设置", icon: "⚙" },
 ];
 
-/** 导航侧栏（§7.2 信息架构，v1.0.0 功能全景）。 */
+/** 导航侧栏（§7.2 信息架构，v1.1.0 功能全景）。 */
 export function Sidebar() {
   const page = useAppStore((s) => s.page);
   const setPage = useAppStore((s) => s.setPage);
@@ -52,7 +53,7 @@ export function Sidebar() {
           </button>
         ))}
       </nav>
-      <div className="px-4 py-3 text-xs text-gray-400 dark:text-slate-500">v1.0.0</div>
+      <div className="px-4 py-3 text-xs text-gray-400 dark:text-slate-500">v1.2.0</div>
     </aside>
   );
 }

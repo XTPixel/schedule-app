@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{ArchiveDay, ArchiveEntry, ArchiveSource, Event, Routine, Task};
+use crate::models::{ArchiveDay, ArchiveEntry, ArchiveSource, Event, LongTask, Routine, Task};
 use crate::timeutil;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +44,16 @@ pub struct StatsTotals {
     pub active_days: i64,
 }
 
+/// V1.2：长期任务投入（独立口径，不计入 totals）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LongTaskStatItem {
+    pub task_id: String,
+    pub title: String,
+    pub count: i64,
+    pub duration_minutes: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsResult {
@@ -53,6 +63,8 @@ pub struct StatsResult {
     pub tag_durations: Vec<TagDuration>,
     pub routine_completion: Vec<RoutineCompletion>,
     pub totals: StatsTotals,
+    /// V1.2：长期任务投入统计（独立口径）。
+    pub long_task_stats: Vec<LongTaskStatItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,12 +90,14 @@ pub struct ReviewResult {
 
 const UNTAGGED: &str = "未分类";
 
-/// 完成趋势 + 标签耗时占比 + 日常完成率（统计页）。
+/// 完成趋势 + 标签耗时占比 + 日常完成率 + 长期任务投入（统计页）。
 pub fn compute_stats(
     days: &BTreeMap<String, ArchiveDay>,
     routines: &[Routine],
     events: &[Event],
     tasks: &[Task],
+    long_tasks: &[LongTask],
+    tz: &str,
     from: NaiveDate,
     to: NaiveDate,
 ) -> StatsResult {
@@ -91,6 +105,7 @@ pub fn compute_stats(
     let tag_durations = build_tag_durations(days, routines, events, tasks);
     let routine_completion = build_routine_completion(days, routines, from, to);
     let totals = build_totals(&trend);
+    let long_task_stats = build_long_task_stats(long_tasks, tz, from, to);
 
     StatsResult {
         from: timeutil::fmt_date(&from),
@@ -99,6 +114,7 @@ pub fn compute_stats(
         tag_durations,
         routine_completion,
         totals,
+        long_task_stats,
     }
 }
 
@@ -223,6 +239,52 @@ fn base_id(source_id: &str) -> &str {
     source_id.split('#').next().unwrap_or(source_id)
 }
 
+/// V1.2：长期任务投入（独立口径）。
+///
+/// - 仅统计有效会话（deletedAt = null）且 `startedAt` 本地日期落在窗口内（D7）；
+/// - 软删除任务的历史会话照常计入（投入是事实）；
+/// - durationMinutes = 窗口内 durationMs 求和后四舍五入到分钟；
+/// - 按 durationMinutes 降序（同分钟数按次数降序）返回。
+fn build_long_task_stats(
+    long_tasks: &[LongTask],
+    tz: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+) -> Vec<LongTaskStatItem> {
+    let mut out: Vec<LongTaskStatItem> = long_tasks
+        .iter()
+        .map(|t| {
+            let mut count = 0i64;
+            let mut total_ms = 0i64;
+            for s in &t.sessions {
+                if s.deleted_at.is_some() {
+                    continue;
+                }
+                let Ok(started) = timeutil::parse_utc(&s.started_at) else { continue };
+                let d = timeutil::to_local(&started, tz).date;
+                if d >= from && d <= to {
+                    count += 1;
+                    total_ms += s.duration_ms.max(0);
+                }
+            }
+            LongTaskStatItem {
+                task_id: t.id.clone(),
+                title: t.title.clone(),
+                count,
+                duration_minutes: ((total_ms as f64) / 60_000.0).round() as i64,
+            }
+        })
+        .filter(|x| x.count > 0)
+        .collect();
+    out.sort_by(|a, b| {
+        b.duration_minutes
+            .cmp(&a.duration_minutes)
+            .then(b.count.cmp(&a.count))
+            .then(a.title.cmp(&b.title))
+    });
+    out
+}
+
 fn build_routine_completion(
     days: &BTreeMap<String, ArchiveDay>,
     routines: &[Routine],
@@ -337,6 +399,8 @@ mod tests {
             &[],
             &events,
             &[],
+            &[],
+            "UTC",
             NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
         );
@@ -344,5 +408,84 @@ mod tests {
         assert_eq!(work.minutes, 30);
         assert_eq!(work.count, 1);
         assert!(result.tag_durations.iter().all(|t| t.tag != "未分类"));
+    }
+
+    fn lt(id: &str, sessions: Vec<LongTaskSession>) -> LongTask {
+        LongTask {
+            id: id.to_string(),
+            title: id.to_string(),
+            description: None,
+            start_date: "2025-01-01".to_string(),
+            due_date: "2025-12-31".to_string(),
+            status: LongTaskStatus::Active,
+            ended_at: None,
+            tags: vec![],
+            priority: Priority::Normal,
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+            sessions,
+        }
+    }
+
+    fn session(id: &str, started_at: &str, duration_ms: i64, deleted: bool) -> LongTaskSession {
+        LongTaskSession {
+            id: id.to_string(),
+            started_at: started_at.to_string(),
+            ended_at: "2025-01-15T10:00:00Z".to_string(),
+            duration_ms,
+            note: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: deleted.then(|| "2025-01-15T11:00:00Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_long_task_stats_window_filters_soft_deleted_and_rounds_minutes() {
+        let tasks = vec![
+            lt(
+                "lt1",
+                vec![
+                    session("s1", "2025-01-15T09:00:00Z", 90_000, false), // 窗口内，1.5 分钟 → 四舍五入 2
+                    session("s2", "2025-01-14T09:00:00Z", 600_000, false), // 窗口外，不计
+                    session("s3", "2025-01-15T10:00:00Z", 1_200_000, true), // 软删除，不计
+                ],
+            ),
+        ];
+        let result = compute_stats(
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &tasks,
+            "UTC",
+            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
+        );
+        assert_eq!(result.long_task_stats.len(), 1);
+        assert_eq!(result.long_task_stats[0].count, 1);
+        assert_eq!(result.long_task_stats[0].duration_minutes, 2);
+        // 独立口径：不计入 totals。
+        assert_eq!(result.totals.duration_minutes, 0);
+    }
+
+    #[test]
+    fn test_long_task_stats_counts_sessions_of_deleted_task() {
+        // 软删除任务的历史投入是事实，照常计入。
+        let mut task = lt("lt1", vec![session("s1", "2025-01-15T09:00:00Z", 60_000, false)]);
+        task.deleted_at = Some("2025-01-16T00:00:00Z".to_string());
+        let result = compute_stats(
+            &BTreeMap::new(),
+            &[],
+            &[],
+            &[],
+            &[task],
+            "UTC",
+            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
+        );
+        assert_eq!(result.long_task_stats.len(), 1);
+        assert_eq!(result.long_task_stats[0].count, 1);
     }
 }

@@ -11,6 +11,7 @@ import { CalendarPage } from "./pages/CalendarPage";
 import { EventsPage } from "./pages/EventsPage";
 import { RoutinesPage } from "./pages/RoutinesPage";
 import { TasksPage } from "./pages/TasksPage";
+import { LongTasksPage } from "./pages/LongTasksPage";
 import { SearchPage } from "./pages/SearchPage";
 import { ArchivePage } from "./pages/ArchivePage";
 import { StatsPage } from "./pages/StatsPage";
@@ -68,6 +69,7 @@ export default function App() {
         {page === "events" && <EventsPage />}
         {page === "routines" && <RoutinesPage />}
         {page === "tasks" && <TasksPage />}
+        {page === "longtasks" && <LongTasksPage />}
         {page === "search" && <SearchPage />}
         {page === "archive" && <ArchivePage />}
         {page === "stats" && <StatsPage />}

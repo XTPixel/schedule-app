@@ -84,6 +84,9 @@ function ChartBody({ stats }: { stats: StatsResult }) {
   const maxCount = Math.max(1, ...stats.trend.map((t) => t.count));
   const maxTag = Math.max(1, ...stats.tagDurations.map((t) => t.minutes));
   const totalMin = stats.totals.durationMinutes;
+  const openDrawer = useAppStore((s) => s.openDrawer);
+  const data = useAppStore((s) => s.data);
+  const setPage = useAppStore((s) => s.setPage);
 
   return (
     <>
@@ -147,6 +150,52 @@ function ChartBody({ stats }: { stats: StatsResult }) {
                 </span>
               </div>
             ))}
+          </div>
+        )}
+      </Section>
+
+      {/* V1.2：长期任务投入（独立口径）。 */}
+      <Section title="长期任务投入（独立口径）">
+        {stats.longTaskStats.length === 0 ? (
+          <div className="flex items-center justify-between">
+            <span className="text-sm text-gray-400 dark:text-slate-500">所选范围内暂无长期任务投入</span>
+            <button
+              type="button"
+              className="rounded-lg border border-gray-200 dark:border-slate-600 px-3 py-1 text-xs text-gray-600 dark:text-slate-300 hover:bg-gray-50 dark:hover:bg-slate-700"
+              onClick={() => setPage("longtasks")}
+            >
+              去长期任务
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {stats.longTaskStats.map((s) => {
+              const max = Math.max(1, ...stats.longTaskStats.map((x) => x.durationMinutes));
+              return (
+                <button
+                  key={s.taskId}
+                  type="button"
+                  className="flex items-center gap-2 text-left"
+                  onClick={() => {
+                    const task = data?.longTasks.find((x) => x.id === s.taskId);
+                    if (task) openDrawer("longtask", task);
+                  }}
+                >
+                  <span className="w-32 shrink-0 truncate text-xs text-gray-600 dark:text-slate-300">
+                    {s.title || "（未命名）"}
+                  </span>
+                  <div className="h-4 flex-1 overflow-hidden rounded bg-gray-100 dark:bg-slate-700">
+                    <div
+                      className="h-full rounded bg-amber-400"
+                      style={{ width: `${(s.durationMinutes / max) * 100}%` }}
+                    />
+                  </div>
+                  <span className="w-32 shrink-0 text-right text-xs tabular-nums text-gray-500 dark:text-slate-400">
+                    {s.count} 次 · {fmtDuration(s.durationMinutes)}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
       </Section>

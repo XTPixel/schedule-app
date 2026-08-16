@@ -1,7 +1,7 @@
 [package]
 name = "schedule-app"
-version = "1.0.1"
-description = "此刻 MOMENT —— 个人日程管理（1.0.1：开机自启动与单实例保护）"
+version = "1.2.0"
+description = "此刻 MOMENT —— 个人日程管理（1.2.0：长期任务）"
 edition = "2021"
 
 [lib]

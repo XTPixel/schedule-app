@@ -84,6 +84,13 @@ pub fn run() {
             commands::delete_routine,
             commands::save_task,
             commands::delete_task,
+            // V1.2：长期任务与会话。
+            commands::save_long_task,
+            commands::delete_long_task,
+            commands::add_long_task_session,
+            commands::update_long_task_session_note,
+            commands::delete_long_task_session,
+            commands::undelete_long_task_session,
             commands::archive_entry,
             commands::complete_candidate,
             commands::update_archive_day,

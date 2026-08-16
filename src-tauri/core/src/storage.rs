@@ -187,6 +187,13 @@ impl Storage {
         Ok(self.read_json::<TasksFile>("tasks.json")?.map(|f| f.tasks).unwrap_or_default())
     }
 
+    pub fn read_long_tasks(&mut self) -> AppResult<Vec<LongTask>> {
+        Ok(self
+            .read_json::<LongTasksFile>("long_tasks.json")?
+            .map(|f| f.long_tasks)
+            .unwrap_or_default())
+    }
+
     pub fn read_config(&mut self) -> AppResult<Config> {
         Ok(self.read_json::<Config>("config.json")?.unwrap_or_default())
     }
@@ -209,6 +216,13 @@ impl Storage {
         self.write_json_atomic(
             "tasks.json",
             &TasksFile { version: CURRENT_VERSION, tasks: tasks.to_vec() },
+        )
+    }
+
+    pub fn save_long_tasks(&mut self, tasks: &[LongTask]) -> AppResult<MtimeStatus> {
+        self.write_json_atomic(
+            "long_tasks.json",
+            &LongTasksFile { version: CURRENT_VERSION, long_tasks: tasks.to_vec() },
         )
     }
 
@@ -264,26 +278,28 @@ impl Storage {
     // 聚合加载
     // -----------------------------------------------------------------------
 
-    /// 加载全部数据（事件/日常/浮动事项/配置/当前月份归档）。
+    /// 加载全部数据（事件/日常/浮动事项/长期任务/配置/当前月份归档）。
     pub fn load_all(&mut self) -> AppResult<AppData> {
         self.ensure()?;
         let events = self.read_events()?;
         let routines = self.read_routines()?;
         let tasks = self.read_tasks()?;
+        let long_tasks = self.read_long_tasks()?;
         let config = self.read_config()?;
         let month = timeutil::current_month_string(&config.timezone);
         let archive = self.load_archive_month(&month)?;
-        Ok(AppData { events, routines, tasks, config, archive })
+        Ok(AppData { events, routines, tasks, long_tasks, config, archive })
     }
 }
 
-/// 迁移步骤分发：v0 → v1 → v2 → v3 → v4（`file` 为相对数据目录的文件名）。
+/// 迁移步骤分发：v0 → v1 → v2 → v3 → v4 → v5（`file` 为相对数据目录的文件名）。
 fn migrate_step(file: &str, from: u32, value: Value) -> Value {
     match from {
         0 => migrate_v0_to_v1(value),
         1 => migrate_v1_to_v2(file, value),
         2 => migrate_v2_to_v3(file, value),
         3 => migrate_v3_to_v4(file, value),
+        4 => migrate_v4_to_v5(value),
         _ => value,
     }
 }
@@ -421,6 +437,14 @@ fn migrate_v3_to_v4(file: &str, mut value: Value) -> Value {
 
     if file == "config.json" {
         obj.entry("tagColors").or_insert(json!({}));
+    }
+    value
+}
+
+/// v4 → v5：写入版本号 5。长期任务为独立新文件，既有文件无需结构变更（无操作迁移）。
+fn migrate_v4_to_v5(mut value: Value) -> Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("version".to_string(), json!(5));
     }
     value
 }
@@ -587,11 +611,43 @@ mod tests {
         let events = storage.read_events().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "e1");
-        // v3→v4 对数据文件结构零改动：保存后除 version 外不新增配置类字段。
+        // v3→v4→v5 对数据文件结构零改动：保存后除 version 外不新增配置类字段。
         storage.save_events(&events).unwrap();
         let raw = fs::read_to_string(dir.join("events.json")).unwrap();
         assert!(!raw.contains("tagColors"));
-        assert!(raw.contains("\"version\": 4"));
+        assert!(raw.contains("\"version\": 5"));
+    }
+
+    #[test]
+    fn test_long_tasks_missing_file_defaults_empty_and_roundtrips() {
+        let dir = tmp_dir("long-tasks");
+        let mut storage = Storage::new(dir.clone());
+        storage.ensure().unwrap();
+        // 新目录：long_tasks.json 缺失 → 空列表，不报错（v1.0/v1.1 旧备份兼容）。
+        assert!(storage.read_long_tasks().unwrap().is_empty());
+
+        let task = LongTask {
+            id: "lt1".to_string(),
+            title: "备考".to_string(),
+            description: None,
+            start_date: "2025-03-01".to_string(),
+            due_date: "2025-06-30".to_string(),
+            status: LongTaskStatus::Active,
+            ended_at: None,
+            tags: vec!["学习".to_string()],
+            priority: Priority::Normal,
+            created_at: "2025-02-20T00:00:00Z".to_string(),
+            updated_at: "2025-02-20T00:00:00Z".to_string(),
+            deleted_at: None,
+            sessions: vec![],
+        };
+        storage.save_long_tasks(&[task.clone()]).unwrap();
+        let loaded = storage.read_long_tasks().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].title, "备考");
+        let raw = fs::read_to_string(dir.join("long_tasks.json")).unwrap();
+        assert!(raw.contains("\"version\": 5"));
+        assert!(raw.contains("\"longTasks\""));
     }
 
     #[test]
