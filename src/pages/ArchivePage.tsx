@@ -4,7 +4,7 @@ import { InlineEdit } from "../components/InlineEdit";
 import { TimeField } from "../components/TimeField";
 import { todayInTz } from "../lib/time";
 import { SOURCE_LABEL } from "../lib/format";
-import { getArchiveMonth } from "../api/ipc";
+import { getArchiveMonth, undeleteLongTaskArchiveDay } from "../api/ipc";
 import type { ArchiveDay, ArchiveFile, ArchiveEntry } from "../types";
 
 function addDays(dateStr: string, days: number): string {
@@ -14,11 +14,29 @@ function addDays(dateStr: string, days: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
 }
 
+function fmtDuration(min: number): string {
+  if (min < 60) return `${min} 分钟`;
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m ? `${h} 小时 ${m} 分` : `${h} 小时`;
+}
+
+const SOURCE_DOT: Record<string, string> = {
+  event: "bg-accent-500",
+  routine: "bg-amber-400",
+  task: "bg-sky-400",
+  longtask: "bg-amber-500",
+  manual: "bg-emerald-500",
+};
+
 /** 归档页（§7.3④）：按天查看流水 + 手动补记 + 编辑/删除。 */
 export function ArchivePage() {
   const data = useAppStore((s) => s.data);
   const addManualArchive = useAppStore((s) => s.addManualArchive);
   const updateArchiveDay = useAppStore((s) => s.updateArchiveDay);
+  const removeArchiveEntry = useAppStore((s) => s.removeArchiveEntry);
+  const refreshStatsIfLoaded = useAppStore((s) => s.refreshStatsIfLoaded);
+  const refresh = useAppStore((s) => s.refresh);
   const askConfirm = useAppStore((s) => s.askConfirm);
   const pushToast = useAppStore((s) => s.pushToast);
   const openDrawer = useAppStore((s) => s.openDrawer);
@@ -59,24 +77,55 @@ export function ArchivePage() {
     saveDay(next);
   }
 
-  function removeEntry(id: string) {
-    const next: ArchiveDay = {
-      entries: entries.filter((x) => x.id !== id),
-      summary: day?.summary ?? null,
-      updatedAt: new Date().toISOString(),
-    };
-    saveDay(next);
-    pushToast("已删除记录", "撤回", () => {
-      const restored = entries.find((x) => x.id === id);
-      if (restored) {
-        saveDay({
-          entries: [...entries.filter((x) => x.id !== id), restored].sort((a, b) =>
-            a.time.localeCompare(b.time),
-          ),
-          summary: day?.summary ?? null,
-          updatedAt: new Date().toISOString(),
-        });
-      }
+  async function reloadMonth() {
+    const month = viewDate.slice(0, 7);
+    setArchive(await getArchiveMonth(month));
+  }
+
+  function onRemove(e: ArchiveEntry) {
+    const isLongTask = e.source === "longtask";
+    const message = isLongTask
+      ? `删除「${e.title || "该记录"}」将同时移除当天对应的长期任务投入记录，确定？`
+      : `删除「${e.title || "该记录"}」？`;
+    askConfirm("删除记录", message, () => {
+      void (async () => {
+        try {
+          const result = await removeArchiveEntry(viewDate, e);
+          if (result.status === "cancelled") {
+            // 外部修改冲突选择「重新加载」时，放弃本地删除。
+            await reloadMonth();
+            return;
+          }
+          await reloadMonth();
+          const restore = async () => {
+            if (isLongTask && e.sourceId && result.sessionIds.length > 0) {
+              await undeleteLongTaskArchiveDay(e.sourceId, viewDate, result.sessionIds);
+              await refresh();
+            } else if (!isLongTask) {
+              // BUG-09：撤回时读取最新月份数据，仅追加目标记录，不复活其它已删记录。
+              const month = viewDate.slice(0, 7);
+              const af = await getArchiveMonth(month);
+              const latestDay = af.days[viewDate] ?? {
+                entries: [],
+                summary: null,
+                updatedAt: new Date().toISOString(),
+              };
+              if (!latestDay.entries.some((x) => x.id === e.id)) {
+                await updateArchiveDay(viewDate, {
+                  ...latestDay,
+                  entries: [...latestDay.entries, e].sort((a, b) => a.time.localeCompare(b.time)),
+                  updatedAt: new Date().toISOString(),
+                });
+              }
+            }
+            await reloadMonth();
+            await refreshStatsIfLoaded();
+          };
+          pushToast("已删除记录", "撤回", () => void restore());
+        } catch (err) {
+          pushToast(`删除记录失败：${String(err)}`);
+        }
+      })();
     });
   }
 
@@ -136,12 +185,10 @@ export function ArchivePage() {
             onClick={async () => {
               if (!title.trim()) return;
               try {
-                // V3.1 T1：补记归入归档页当前浏览日期 viewDate；失败 Toast 可见。
                 await addManualArchive(title.trim(), time, note.trim(), viewDate);
                 setTitle("");
                 setNote("");
-                const month = viewDate.slice(0, 7);
-                setArchive(await getArchiveMonth(month));
+                await reloadMonth();
               } catch (e) {
                 pushToast(`添加记录失败：${String(e)}`);
               }
@@ -157,57 +204,65 @@ export function ArchivePage() {
         {entries.length === 0 ? (
           <div className="py-6 text-center text-sm text-gray-400 dark:text-slate-500">这一天还没有记录</div>
         ) : (
-          <ol className="space-y-2">
+          <ol className="flex flex-col gap-2">
             {entries.map((e) => {
-              // V1.2.1：长期任务条目由会话自动聚合，禁止在此编辑 / 删除；点击跳转任务详情。
               const isLongTask = e.source === "longtask";
               const longTask = isLongTask
                 ? data?.longTasks.find((x) => x.id === e.sourceId && x.deletedAt == null)
                 : undefined;
               return (
-              <li
-                key={e.id}
-                className={`flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-gray-50 dark:hover:bg-slate-700 ${isLongTask && longTask ? "cursor-pointer" : ""}`}
-                onClick={() => {
-                  if (isLongTask && longTask) openDrawer("longtask", longTask);
-                }}
-              >
-                {isLongTask ? (
-                  <span className="w-24 shrink-0 tabular-nums text-sm text-gray-700 dark:text-slate-200">{e.time}</span>
-                ) : (
-                  <span className="w-24 shrink-0">
-                    <TimeField compact value={e.time} onChange={(t) => saveEntry({ ...e, time: t })} />
-                  </span>
-                )}
-                <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-500" />
-                <div className="min-w-0 flex-1">
-                  {isLongTask ? (
-                    <div className="font-medium text-gray-900 dark:text-slate-100">{e.title}</div>
-                  ) : (
-                    <InlineEdit
-                      value={e.title}
-                      onSave={(title) => saveEntry({ ...e, title })}
-                      className="font-medium text-gray-900 dark:text-slate-100"
-                    />
-                  )}
-                  <div className="mt-0.5 flex gap-2 text-xs text-gray-400 dark:text-slate-500">
-                    <span>{SOURCE_LABEL[e.source]}</span>
-                    {e.note && <span className="whitespace-pre-line">{e.note}</span>}
-                    {isLongTask && <span>（由长期任务会话自动聚合）</span>}
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  disabled={isLongTask}
-                  title={isLongTask ? "该条目由长期任务会话自动聚合，删除 / 编辑请到长期任务详情" : undefined}
-                  className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
-                  onClick={() =>
-                    askConfirm("删除记录", `删除「${e.title || "该记录"}」？`, () => removeEntry(e.id))
-                  }
+                <li
+                  key={e.id}
+                  className={`group flex items-start gap-3 rounded-xl border px-3 py-2.5 transition ${
+                    isLongTask && longTask
+                      ? "cursor-pointer border-gray-100 dark:border-slate-700 hover:border-accent-200 dark:hover:border-accent-800 hover:bg-gray-50 dark:hover:bg-slate-700/50"
+                      : "border-transparent hover:bg-gray-50 dark:hover:bg-slate-700/50"
+                  }`}
+                  onClick={() => {
+                    if (isLongTask && longTask) openDrawer("longtask", longTask);
+                  }}
                 >
-                  删除
-                </button>
-              </li>
+                  <div className="flex h-11 w-16 shrink-0 flex-col items-center justify-center rounded-lg bg-gray-100 dark:bg-slate-700/60">
+                    <span className="text-sm font-semibold tabular-nums text-gray-800 dark:text-slate-100">{e.time}</span>
+                  </div>
+                  <span className={`mt-3 h-2 w-2 shrink-0 rounded-full ${SOURCE_DOT[e.source] ?? "bg-gray-400"}`} />
+                  <div className="min-w-0 flex-1 pt-0.5">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      {isLongTask ? (
+                        <span className="truncate text-sm font-medium text-gray-900 dark:text-slate-100">{e.title}</span>
+                      ) : (
+                        <InlineEdit
+                          value={e.title}
+                          onSave={(title) => saveEntry({ ...e, title })}
+                          className="min-w-0 flex-1 truncate text-sm font-medium text-gray-900 dark:text-slate-100"
+                          textClassName="text-sm font-medium text-gray-900 dark:text-slate-100"
+                        />
+                      )}
+                      <span className="rounded bg-gray-100 dark:bg-slate-700 px-1.5 py-0.5 text-[11px] text-gray-500 dark:text-slate-400">
+                        {SOURCE_LABEL[e.source]}
+                      </span>
+                      {e.durationMinutes != null && (
+                        <span className="text-[11px] tabular-nums text-gray-400 dark:text-slate-500">
+                          耗时 {fmtDuration(e.durationMinutes)}
+                        </span>
+                      )}
+                    </div>
+                    {e.note && (
+                      <p className="mt-1 whitespace-pre-line text-xs leading-5 text-gray-500 dark:text-slate-400">{e.note}</p>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    title="删除记录"
+                    className="mt-0.5 rounded-md px-1.5 py-1 text-xs text-gray-400 dark:text-slate-500 hover:bg-red-50 dark:hover:bg-red-900/20 hover:text-red-500"
+                    onClick={(ev) => {
+                      ev.stopPropagation();
+                      onRemove(e);
+                    }}
+                  >
+                    ✕
+                  </button>
+                </li>
               );
             })}
           </ol>

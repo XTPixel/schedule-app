@@ -2,8 +2,8 @@
 //! Git 一键备份与移动端只读服务已完全移除（对应模块、命令、状态与前端入口均已删除）。
 
 mod commands;
-mod state;
 pub mod platform;
+mod state;
 
 use std::collections::HashSet;
 use std::fs;
@@ -91,6 +91,9 @@ pub fn run() {
             commands::update_long_task_session_note,
             commands::delete_long_task_session,
             commands::undelete_long_task_session,
+            // V1.2.2：归档页删除 / 撤回长期任务聚合条目。
+            commands::delete_long_task_archive_day,
+            commands::undelete_long_task_archive_day,
             commands::archive_entry,
             commands::complete_candidate,
             commands::update_archive_day,
@@ -156,13 +159,17 @@ pub(crate) fn register_hotkey(app: &tauri::AppHandle) {
         .map(|c| c.behavior.global_hotkey.clone())
         .unwrap_or_default();
     // 快捷键解析对大小写敏感，统一转小写（如 Ctrl+Shift+A → ctrl+shift+a）。
-    let Ok(shortcut) = hotkey.to_lowercase().parse::<Shortcut>() else { return };
+    let Ok(shortcut) = hotkey.to_lowercase().parse::<Shortcut>() else {
+        return;
+    };
     let _ = app.global_shortcut().unregister_all();
-    let _ = app.global_shortcut().on_shortcut(shortcut, |app, _s, event| {
-        if event.state() == ShortcutState::Pressed {
-            show_main(app);
-        }
-    });
+    let _ = app
+        .global_shortcut()
+        .on_shortcut(shortcut, |app, _s, event| {
+            if event.state() == ShortcutState::Pressed {
+                show_main(app);
+            }
+        });
 }
 
 /// 按当前配置应用全局快捷键与开机自启动（启动时 + 配置变更时统一入口）。
@@ -183,8 +190,14 @@ fn apply_behavior_settings(app: &tauri::AppHandle) {
 fn build_tray(app: &tauri::AppHandle, notify_enabled: bool) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "打开主界面", true, None::<&str>)?;
     let quick_add = MenuItem::with_id(app, "quick_add", "快速新增", true, None::<&str>)?;
-    let notify_toggle =
-        CheckMenuItem::with_id(app, "toggle_notify", "通知开关", true, notify_enabled, None::<&str>)?;
+    let notify_toggle = CheckMenuItem::with_id(
+        app,
+        "toggle_notify",
+        "通知开关",
+        true,
+        notify_enabled,
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &quick_add, &notify_toggle, &quit])?;
 
@@ -195,28 +208,27 @@ fn build_tray(app: &tauri::AppHandle, notify_enabled: bool) -> tauri::Result<()>
     if let Some(icon) = app.default_window_icon() {
         tray = tray.icon(icon.clone());
     }
-    tray
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_main(app),
-            "quick_add" => {
-                let _ = app.emit("tray-quick-add", ());
-                show_main(app);
-            }
-            "toggle_notify" => toggle_notify(app),
-            "quit" => app.exit(0),
-            _ => {}
-        })
-        .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            } = event
-            {
-                show_main(tray.app_handle());
-            }
-        })
-        .build(app)?;
+    tray.on_menu_event(|app, event| match event.id.as_ref() {
+        "show" => show_main(app),
+        "quick_add" => {
+            let _ = app.emit("tray-quick-add", ());
+            show_main(app);
+        }
+        "toggle_notify" => toggle_notify(app),
+        "quit" => app.exit(0),
+        _ => {}
+    })
+    .on_tray_icon_event(|tray, event| {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
+            show_main(tray.app_handle());
+        }
+    })
+    .build(app)?;
     Ok(())
 }
 
@@ -317,7 +329,11 @@ fn check_and_notify(app: &tauri::AppHandle) {
             continue;
         }
         notified.insert(r.dedup_key.clone());
-        let mut builder = app.notification().builder().title(r.title.as_str()).body(r.body.as_str());
+        let mut builder = app
+            .notification()
+            .builder()
+            .title(r.title.as_str())
+            .body(r.body.as_str());
         // V3.1 T6：提示音开关真实接入桌面通知（默认系统提示音）。
         if sound_enabled {
             builder = builder.sound("Default");

@@ -67,7 +67,8 @@ export function CalendarPage() {
 
   useEffect(() => {
     void loadCalendar(range.start, range.end);
-  }, [range.start, range.end, loadCalendar]);
+    // V1.2.2：日常数据变化（如新增/修改「每隔 N 天」窗口）时重载日历，避免仍显示旧命中结果。
+  }, [range.start, range.end, loadCalendar, data?.routines]);
 
   const byDate = useMemo(() => {
     const map = new Map<string, { occurrences: Occurrence[]; routines: { title: string; time: string; tags: string[] }[] }>();

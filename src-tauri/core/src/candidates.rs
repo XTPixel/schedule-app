@@ -112,6 +112,8 @@ const UPCOMING_SOON_MIN: i64 = 30;
 const NO_END_IN_PROGRESS_HOURS: i64 = 4;
 /// 提醒提前量（分钟）：事件开始提醒。
 const EVENT_START_NOTIFY_MIN: i64 = 15;
+/// V1.2.2：提醒偏移量安全上限（365 天）。超限值视为异常数据，按无提醒处理（BUG-02）。
+const MAX_REMINDER_OFFSET_MINUTES: i64 = 525_600;
 /// 次级候选数量（§8.4 默认 5）。
 const SECONDARY_LIMIT: usize = 5;
 
@@ -127,7 +129,11 @@ fn prio_w(p: Priority) -> i64 {
 // 入口
 // ---------------------------------------------------------------------------
 
-pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> AppResult<CandidatesResult> {
+pub fn compute_candidates(
+    data: &AppData,
+    now_str: &str,
+    config: &Config,
+) -> AppResult<CandidatesResult> {
     let now = timeutil::parse_utc(now_str)?;
     let tz = timeutil::resolve_tz(&config.timezone);
     let local = timeutil::to_local(&now, &config.timezone);
@@ -161,7 +167,11 @@ pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> App
             if !time_window_matches_date(w, local.date) {
                 continue;
             }
-            let (Ok(start), Ok(end)) = (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end)) else { continue };
+            let (Ok(start), Ok(end)) =
+                (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end))
+            else {
+                continue;
+            };
             if !done && timeutil::time_in_window(local.time, start, end) {
                 // 层级 2：当前窗口内（V3.0 B5：当日已完成则不再作为候选）
                 let remaining = timeutil::minutes_between(local.time, end);
@@ -183,8 +193,14 @@ pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> App
                     time_label: Some(format!("{}–{}", w.start, w.end)),
                 });
             } else if !done {
-                // 层级 3：逾期可补（窗口结束后 grace 小时内）
-                let ended = timeutil::local_to_utc(today, end, tz);
+                // 层级 3：逾期可补（窗口结束后 grace 小时内）。
+                // V1.2.2 BUG-10：跨午夜窗口的结束时刻属于次日。
+                let end_date = if end <= start {
+                    today.succ_opt().unwrap_or(today)
+                } else {
+                    today
+                };
+                let ended = timeutil::local_to_utc(end_date, end, tz);
                 if now > ended {
                     let overdue = timeutil::minutes_between_utc(&ended, &now);
                     if overdue <= grace_hours * 60 {
@@ -218,15 +234,19 @@ pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> App
         let mut time_label = None;
         if let Some(dl) = &t.deadline {
             if let Ok(dl_utc) = timeutil::parse_utc(dl) {
-                let days = (dl_utc - now).num_days();
-                if days < 0 {
+                // V1.2.2 BUG-07：按分钟判定逾期，不足 24 小时的负差不再被截断为 0 天。
+                let minutes = timeutil::minutes_between_utc(&now, &dl_utc);
+                if minutes < 0 {
                     score += 150;
                     reason = "已过截止日 · 待办".to_string();
                     time_label = Some("已逾期".to_string());
-                } else if days <= 3 {
-                    score += (3 - days) * 50;
-                    reason = format!("{days} 天后截止");
-                    time_label = Some(format!("{days} 天后截止"));
+                } else {
+                    let days = minutes / 1440;
+                    if days <= 3 {
+                        score += (3 - days) * 50;
+                        reason = format!("{days} 天后截止");
+                        time_label = Some(format!("{days} 天后截止"));
+                    }
                 }
             }
         }
@@ -247,15 +267,24 @@ pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> App
 
     // ---- 排序：层级升序，层内分数降序；日常同分按「最久未做」优先 ----
     candidates.sort_by(|a, b| {
-        b.layer.cmp(&a.layer).reverse().then(b.score.cmp(&a.score)).then_with(|| {
-            let ar = last_done.get(&a.source_id);
-            let br = last_done.get(&b.source_id);
-            cmp_last_done(ar, br)
-        })
+        b.layer
+            .cmp(&a.layer)
+            .reverse()
+            .then(b.score.cmp(&a.score))
+            .then_with(|| {
+                let ar = last_done.get(&a.source_id);
+                let br = last_done.get(&b.source_id);
+                cmp_last_done(ar, br)
+            })
     });
 
     let main = candidates.first().cloned();
-    let secondary = candidates.iter().skip(1).take(SECONDARY_LIMIT).cloned().collect();
+    let secondary = candidates
+        .iter()
+        .skip(1)
+        .take(SECONDARY_LIMIT)
+        .cloned()
+        .collect();
 
     // ---- 今日时间轴 ----
     let mut timeline_events: Vec<Event> = occurrences.iter().map(|o| o.event.clone()).collect();
@@ -315,7 +344,12 @@ pub fn compute_candidates(data: &AppData, now_str: &str, config: &Config) -> App
 // 事件候选（层级 1 / 4）
 // ---------------------------------------------------------------------------
 
-fn push_event_candidate(occ: &recurrence::Occurrence, now: &DateTime<Utc>, tz_name: &str, out: &mut Vec<Candidate>) {
+fn push_event_candidate(
+    occ: &recurrence::Occurrence,
+    now: &DateTime<Utc>,
+    tz_name: &str,
+    out: &mut Vec<Candidate>,
+) {
     let ev = &occ.event;
     let source_id = &occ.key;
     let series_id: Option<String> = occ.series_id.clone();
@@ -358,7 +392,9 @@ fn push_event_candidate(occ: &recurrence::Occurrence, now: &DateTime<Utc>, tz_na
         return;
     }
 
-    let Ok(start) = timeutil::parse_utc(&ev.start) else { return };
+    let Ok(start) = timeutil::parse_utc(&ev.start) else {
+        return;
+    };
     let end = ev.end.as_deref().and_then(|e| timeutil::parse_utc(e).ok());
     let label = time_label(ev, tz_name);
     let dur = event_duration_minutes(ev, tz);
@@ -438,10 +474,16 @@ fn event_duration_minutes(ev: &Event, tz: chrono_tz::Tz) -> Option<i64> {
     let end = if ev.all_day {
         start + chrono::Duration::hours(24)
     } else {
-        ev.end.as_deref().and_then(|e| timeutil::parse_utc(e).ok())?
+        ev.end
+            .as_deref()
+            .and_then(|e| timeutil::parse_utc(e).ok())?
     };
     let m = (end - start).num_minutes();
-    if m > 0 { Some(m) } else { None }
+    if m > 0 {
+        Some(m)
+    } else {
+        None
+    }
 }
 
 fn event_sort_key(ev: &Event) -> (String, String) {
@@ -457,7 +499,10 @@ fn event_sort_key(ev: &Event) -> (String, String) {
 // ---------------------------------------------------------------------------
 
 /// 当日已完成集合（用于过滤「已归档过的（当天）」）。
-fn collect_done_today(archive: &ArchiveFile, today: &NaiveDate) -> std::collections::HashSet<(ArchiveSource, String)> {
+fn collect_done_today(
+    archive: &ArchiveFile,
+    today: &NaiveDate,
+) -> std::collections::HashSet<(ArchiveSource, String)> {
     let mut set = std::collections::HashSet::new();
     let key = timeutil::fmt_date(today);
     if let Some(day) = archive.days.get(&key) {
@@ -517,8 +562,10 @@ fn build_reminders(
     let dnd = config.notifications.do_not_disturb.enabled
         && timeutil::time_in_window(
             local.time,
-            timeutil::parse_hhmm(&config.notifications.do_not_disturb.start).unwrap_or_else(|_| NaiveTime::from_hms_opt(22, 0, 0).unwrap()),
-            timeutil::parse_hhmm(&config.notifications.do_not_disturb.end).unwrap_or_else(|_| NaiveTime::from_hms_opt(8, 0, 0).unwrap()),
+            timeutil::parse_hhmm(&config.notifications.do_not_disturb.start)
+                .unwrap_or_else(|_| NaiveTime::from_hms_opt(22, 0, 0).unwrap()),
+            timeutil::parse_hhmm(&config.notifications.do_not_disturb.end)
+                .unwrap_or_else(|_| NaiveTime::from_hms_opt(8, 0, 0).unwrap()),
         );
     // V3.0 F5：按优先级分级计算是否可弹系统通知。
     let notify = |priority: Priority| -> bool {
@@ -539,22 +586,28 @@ fn build_reminders(
         .iter()
         .filter(|e| is_event_active(e))
         .flat_map(|e| e.reminders.iter().map(|r| r.offset_minutes))
+        .filter(|m| (0..=MAX_REMINDER_OFFSET_MINUTES).contains(m))
         .max()
         .unwrap_or(0)
         .div_euclid(1440)
         .max(1) as i64;
     let horizon = local.date + chrono::Duration::days(max_offset_days + 1);
-    let occurrences = recurrence::expand_events(&data.events, local.date, horizon, &config.timezone);
+    let occurrences =
+        recurrence::expand_events(&data.events, local.date, horizon, &config.timezone);
     for occ in &occurrences {
         let ev = &occ.event;
         // v1.1.0：已完成的来源不执行提醒。
-        if ev.completed_at.is_some() || done_today.contains(&(ArchiveSource::Event, occ.key.clone())) {
+        if ev.completed_at.is_some()
+            || done_today.contains(&(ArchiveSource::Event, occ.key.clone()))
+        {
             continue;
         }
         if ev.all_day {
             continue;
         }
-        let Ok(start) = timeutil::parse_utc(&ev.start) else { continue };
+        let Ok(start) = timeutil::parse_utc(&ev.start) else {
+            continue;
+        };
         let until = timeutil::minutes_between_utc(now, &start);
         if until >= 0 && until <= EVENT_START_NOTIFY_MIN {
             out.push(ReminderNotice {
@@ -577,9 +630,12 @@ fn build_reminders(
                 should_notify: notify(ev.priority),
             });
         }
-        // 多级提前提醒：消费 reminders 中的全部偏移量。
+        // 多级提前提醒：消费 reminders 中的全部偏移量（异常超限值忽略）。
         for r in &ev.reminders {
             let offset = r.offset_minutes;
+            if !(0..=MAX_REMINDER_OFFSET_MINUTES).contains(&offset) {
+                continue;
+            }
             if until > 0 && until <= offset && offset > EVENT_START_NOTIFY_MIN {
                 out.push(ReminderNotice {
                     kind: "event_reminder".to_string(),
@@ -606,9 +662,19 @@ fn build_reminders(
             if !time_window_matches_date(w, local.date) {
                 continue;
             }
-            let (Ok(start), Ok(end)) = (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end)) else { continue };
+            let (Ok(start), Ok(end)) =
+                (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end))
+            else {
+                continue;
+            };
             let start_utc = timeutil::local_to_utc(local.date, start, tz);
-            let end_utc = timeutil::local_to_utc(local.date, end, tz);
+            // V1.2.2 BUG-10：跨午夜窗口的结束时刻属于次日。
+            let end_date = if end <= start {
+                local.date.succ_opt().unwrap_or(local.date)
+            } else {
+                local.date
+            };
+            let end_utc = timeutil::local_to_utc(end_date, end, tz);
             let until_start = timeutil::minutes_between_utc(now, &start_utc);
             let until_end = timeutil::minutes_between_utc(now, &end_utc);
             if until_start >= 0 && until_start <= EVENT_START_NOTIFY_MIN {
@@ -648,7 +714,11 @@ fn build_reminders(
                         title: "浮动事项今日截止".to_string(),
                         body: t.title.clone(),
                         source_id: t.id.clone(),
-                        dedup_key: format!("task_deadline:{}:{}", t.id, local.date.format("%Y-%m-%d")),
+                        dedup_key: format!(
+                            "task_deadline:{}:{}",
+                            t.id,
+                            local.date.format("%Y-%m-%d")
+                        ),
                         priority: t.priority,
                         should_notify: notify(t.priority),
                     });
@@ -692,7 +762,10 @@ mod tests {
             start: start.to_string(),
             end: None,
             all_day: false,
-            reminders: reminders.into_iter().map(|offset_minutes| crate::models::Reminder { offset_minutes }).collect(),
+            reminders: reminders
+                .into_iter()
+                .map(|offset_minutes| crate::models::Reminder { offset_minutes })
+                .collect(),
             repeat: None,
             tags: vec![],
             priority: Priority::Normal,
@@ -748,11 +821,15 @@ mod tests {
 
     /// 向测试数据写入一条「今日已完成」归档（用于验证已完成来源不再提醒）。
     fn mark_done_today(data: &mut AppData, date: &str, source: ArchiveSource, source_id: &str) {
-        let day = data.archive.days.entry(date.to_string()).or_insert_with(|| crate::models::ArchiveDay {
-            entries: vec![],
-            summary: None,
-            updated_at: String::new(),
-        });
+        let day = data
+            .archive
+            .days
+            .entry(date.to_string())
+            .or_insert_with(|| crate::models::ArchiveDay {
+                entries: vec![],
+                summary: None,
+                updated_at: String::new(),
+            });
         day.entries.push(crate::models::ArchiveEntry {
             id: format!("a-{source_id}"),
             time: "08:00".to_string(),
@@ -780,7 +857,13 @@ mod tests {
             .filter(|r| r.kind == "event_reminder")
             .map(|r| r.dedup_key.clone())
             .collect();
-        keys.sort_by_key(|k| k.rsplit(':').next().unwrap_or("0").parse::<i64>().unwrap_or(0));
+        keys.sort_by_key(|k| {
+            k.rsplit(':')
+                .next()
+                .unwrap_or("0")
+                .parse::<i64>()
+                .unwrap_or(0)
+        });
         assert_eq!(keys, vec!["event_reminder:e1:60", "event_reminder:e1:120"]);
     }
 
@@ -800,7 +883,13 @@ mod tests {
             .map(|r| r.dedup_key.clone())
             .collect();
         keys.sort();
-        assert_eq!(keys, vec!["routine_window:r1:08:55:end", "routine_window:r1:09:00:start"]);
+        assert_eq!(
+            keys,
+            vec![
+                "routine_window:r1:08:55:end",
+                "routine_window:r1:09:00:start"
+            ]
+        );
     }
 
     #[test]
@@ -813,7 +902,10 @@ mod tests {
         config.timezone = "UTC".to_string();
         let result = compute_candidates(&data, "2025-01-15T08:00:00Z", &config).unwrap();
 
-        assert!(!result.due_reminders.iter().any(|r| r.kind == "task_deadline"));
+        assert!(!result
+            .due_reminders
+            .iter()
+            .any(|r| r.kind == "task_deadline"));
     }
 
     #[test]
@@ -827,7 +919,10 @@ mod tests {
         config.timezone = "UTC".to_string();
         let result = compute_candidates(&data, "2025-01-15T08:00:00Z", &config).unwrap();
 
-        assert!(!result.due_reminders.iter().any(|r| r.kind == "task_deadline"));
+        assert!(!result
+            .due_reminders
+            .iter()
+            .any(|r| r.kind == "task_deadline"));
     }
 
     #[test]
@@ -841,7 +936,12 @@ mod tests {
             end: None,
         });
         let mut data = base_data(vec![ev], vec![]);
-        mark_done_today(&mut data, "2025-01-15", ArchiveSource::Event, "e1#2025-01-15");
+        mark_done_today(
+            &mut data,
+            "2025-01-15",
+            ArchiveSource::Event,
+            "e1#2025-01-15",
+        );
         let mut config = Config::default();
         config.timezone = "UTC".to_string();
         let result = compute_candidates(&data, "2025-01-15T08:50:00Z", &config).unwrap();
@@ -862,7 +962,10 @@ mod tests {
         config.timezone = "UTC".to_string();
         let result = compute_candidates(&data, "2025-01-15T08:50:00Z", &config).unwrap();
 
-        assert!(!result.due_reminders.iter().any(|r| r.kind == "routine_window"));
+        assert!(!result
+            .due_reminders
+            .iter()
+            .any(|r| r.kind == "routine_window"));
     }
 
     #[test]
@@ -875,6 +978,42 @@ mod tests {
         config.timezone = "UTC".to_string();
         let result = compute_candidates(&data, "2025-01-15T08:00:00Z", &config).unwrap();
 
-        assert!(result.due_reminders.iter().any(|r| r.kind == "task_deadline" && r.source_id == "t1"));
+        assert!(result
+            .due_reminders
+            .iter()
+            .any(|r| r.kind == "task_deadline" && r.source_id == "t1"));
+    }
+
+    #[test]
+    fn test_huge_reminder_offset_is_ignored_without_panic() {
+        // BUG-02：i64 上限提醒偏移不再导致日期加法 panic。
+        let mut ev = event_at("e1", "2025-01-15T09:00:00Z", vec![i64::MAX]);
+        ev.status = ItemStatus::Active;
+        let data = base_data(vec![ev], vec![]);
+        let mut config = Config::default();
+        config.timezone = "UTC".to_string();
+        let result = compute_candidates(&data, "2025-01-15T08:00:00Z", &config).unwrap();
+        assert!(result
+            .due_reminders
+            .iter()
+            .all(|r| r.kind != "event_reminder"));
+    }
+
+    #[test]
+    fn test_task_overdue_less_than_24h_is_not_zero_days() {
+        // BUG-07：截止已过但不足 24 小时应显示已逾期，而不是「0 天后截止」。
+        let task = task_at("t1", Some("2025-01-15T10:00:00Z"), ItemStatus::Active);
+        let mut data = base_data(vec![], vec![]);
+        data.tasks = vec![task];
+        let mut config = Config::default();
+        config.timezone = "UTC".to_string();
+        let result = compute_candidates(&data, "2025-01-15T11:30:00Z", &config).unwrap();
+        let c = result
+            .secondary
+            .iter()
+            .find(|c| c.source_id == "t1")
+            .or(result.main.as_ref().filter(|c| c.source_id == "t1"))
+            .unwrap();
+        assert_eq!(c.reason, "已过截止日 · 待办");
     }
 }

@@ -53,7 +53,7 @@ export function Sidebar() {
           </button>
         ))}
       </nav>
-      <div className="px-4 py-3 text-xs text-gray-400 dark:text-slate-500">v1.2.1</div>
+      <div className="px-4 py-3 text-xs text-gray-400 dark:text-slate-500">v1.2.2</div>
     </aside>
   );
 }

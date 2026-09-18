@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/版本-1.2.1-2563EB" />
+  <img alt="Version" src="https://img.shields.io/badge/版本-1.2.2-2563EB" />
   <img alt="Platform" src="https://img.shields.io/badge/平台-Windows-0078D6" />
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2.x-FFC131" />
   <img alt="React" src="https://img.shields.io/badge/React-18-61DAFB" />

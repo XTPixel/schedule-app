@@ -20,7 +20,13 @@ export function RoutinesPage() {
   function windowText(r: Routine): string {
     if (!r.timeWindows.length) return "无时间窗口";
     return r.timeWindows
-      .map((w) => `${weekdayLabel(w.daysOfWeek)} ${w.start}–${w.end}`)
+      .map((w) => {
+        const mode =
+          w.everyDays != null
+            ? `从 ${w.anchorDate ?? "?"} 起每隔 ${w.everyDays} 天`
+            : weekdayLabel(w.daysOfWeek);
+        return `${mode} ${w.start}–${w.end}`;
+      })
       .join("；");
   }
 

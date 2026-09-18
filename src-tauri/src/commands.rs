@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 
 use chrono::Duration;
 use schedule_core::{
-    apply_template, compute_candidates, compute_review, compute_stats, dispatch_hook, expand_events,
-    list_hooks, new_template, new_template_item, parse_natural_language, preview_template,
-    time_window_matches_date, timeutil, ArchiveDay, ArchiveEntry, ArchiveFile, ArchiveSource, AppData,
-    CalendarData, CalendarRoutineWindow, CandidatesResult, Config, Event, HookInfo, HookRunResult,
-    ItemStatus, LongTask, LongTaskSession, LongTaskStatus, NlpEvent, ReviewResult, Routine, SearchQuery,
-    SearchResult, StatsResult, Storage, Task, Template, TemplateApplyResult, TemplateKind, TemplatePreview,
+    apply_template, compute_candidates, compute_review, compute_stats, dispatch_hook,
+    expand_events, list_hooks, new_template, new_template_item, parse_natural_language,
+    preview_template, time_window_matches_date, timeutil, AppData, ArchiveDay, ArchiveEntry,
+    ArchiveFile, ArchiveSource, CalendarData, CalendarRoutineWindow, CandidatesResult, Config,
+    Event, HookInfo, HookRunResult, ItemStatus, LongTask, LongTaskSession, LongTaskStatus,
+    NlpEvent, ReviewResult, Routine, SearchQuery, SearchResult, StatsResult, Storage, Task,
+    Template, TemplateApplyResult, TemplateKind, TemplatePreview,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -37,9 +38,10 @@ fn dispatch_hook_if_enabled(enabled: bool, data_dir: &Path, name: &str, payload:
 }
 
 /// 绝对时刻：入站接受任意 ISO 时区，落盘统一归一化为 UTC `Z`（§5.8）。
-/// 全天事件的 start/end 为纯日期，原样保留。
+/// 全天事件的 start/end 为纯日期，原样保留但必须通过日期格式校验（BUG-22）。
 fn normalize_absolute(s: &str, all_day: bool) -> Result<String, String> {
     if all_day {
+        timeutil::parse_date(s).map_err(|e| format!("全天事件日期无效：{e}"))?;
         Ok(s.to_string())
     } else {
         timeutil::normalize_to_utc(s).map_err(|e| e.to_string())
@@ -48,6 +50,19 @@ fn normalize_absolute(s: &str, all_day: bool) -> Result<String, String> {
 
 fn month_of(date: &str) -> String {
     date.split('-').take(2).collect::<Vec<_>>().join("-")
+}
+
+/// `YYYY-MM` 且月份合法（BUG-27：拒绝路径穿越 / 垃圾月份参数）。
+fn is_valid_month(s: &str) -> bool {
+    let mut parts = s.split('-');
+    let (Some(y), Some(m), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    y.len() == 4
+        && y.chars().all(|c| c.is_ascii_digit())
+        && m.len() == 2
+        && m.chars().all(|c| c.is_ascii_digit())
+        && (1..=12).contains(&m.parse::<u32>().unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -60,7 +75,8 @@ pub fn load_all_data(state: State<AppState>) -> Result<AppData, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let mut data = storage.load_all().map_err(|e| e.to_string())?;
     // V1.2.1：升级前历史会话 / 归档缺漏回填（只补齐缺失，不覆盖已有条目）。
-    backfill_long_task_archives(&mut storage, &data).map_err(|e| format!("长期任务归档对账失败：{e}"))?;
+    backfill_long_task_archives(&mut storage, &data)
+        .map_err(|e| format!("长期任务归档对账失败：{e}"))?;
     // 回填可能修改当前月份归档：重新加载一次，保证返回的 archive 与磁盘一致。
     data = storage.load_all().map_err(|e| e.to_string())?;
     if let Ok(mut cfg) = state.config.lock() {
@@ -75,8 +91,17 @@ pub fn get_now_candidates(now: String, state: State<AppState>) -> Result<Candida
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let data = storage.load_all().map_err(|e| e.to_string())?;
     let result = compute_candidates(&data, &now, &data.config).map_err(|e| e.to_string())?;
-    let hooks_enabled = state.config.lock().map(|c| c.hooks.enabled).unwrap_or(false);
-    dispatch_hook_if_enabled(hooks_enabled, storage.data_dir(), "on_candidate_refresh", &result);
+    let hooks_enabled = state
+        .config
+        .lock()
+        .map(|c| c.hooks.enabled)
+        .unwrap_or(false);
+    dispatch_hook_if_enabled(
+        hooks_enabled,
+        storage.data_dir(),
+        "on_candidate_refresh",
+        &result,
+    );
     Ok(result)
 }
 
@@ -100,13 +125,42 @@ pub fn save_event(event: Event, state: State<AppState>) -> Result<Event, String>
     ev.start = normalize_absolute(&ev.start, ev.all_day)?;
     if let Some(end) = &ev.end {
         ev.end = Some(normalize_absolute(end, ev.all_day)?);
+        // V1.2.2 BUG-12：结束必须晚于开始。
+        let start_key = if ev.all_day {
+            timeutil::parse_date(&ev.start)
+                .map_err(|e| e.to_string())?
+                .format("%Y-%m-%d")
+                .to_string()
+        } else {
+            timeutil::normalize_to_utc(&ev.start).map_err(|e| e.to_string())?
+        };
+        let end_key = if ev.all_day {
+            timeutil::parse_date(&ev.end.as_deref().unwrap_or_default())
+                .map_err(|e| e.to_string())?
+                .format("%Y-%m-%d")
+                .to_string()
+        } else {
+            timeutil::normalize_to_utc(ev.end.as_deref().unwrap_or_default())
+                .map_err(|e| e.to_string())?
+        };
+        if ev.all_day {
+            if end_key < start_key {
+                return Err("全天事件结束日期不能早于开始日期".to_string());
+            }
+        } else if end_key <= start_key {
+            return Err("结束时间不能早于或等于开始时间".to_string());
+        }
     }
     match events.iter_mut().find(|e| e.id == ev.id) {
         Some(existing) => *existing = ev.clone(),
         None => events.push(ev.clone()),
     }
     storage.save_events(&events).map_err(|e| e.to_string())?;
-    let hooks_enabled = state.config.lock().map(|c| c.hooks.enabled).unwrap_or(false);
+    let hooks_enabled = state
+        .config
+        .lock()
+        .map(|c| c.hooks.enabled)
+        .unwrap_or(false);
     dispatch_hook_if_enabled(hooks_enabled, storage.data_dir(), "on_event_saved", &ev);
     Ok(ev)
 }
@@ -133,11 +187,13 @@ pub fn delete_event(id: String, state: State<AppState>) -> Result<(), String> {
 /// V1.2.1：日常窗口校验（模式互斥 / N 范围 / 锚点合法 / 时间区间）。
 fn validate_routine(r: &Routine) -> Result<(), String> {
     for w in &r.time_windows {
-        let (Ok(start), Ok(end)) = (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end)) else {
+        let (Ok(start), Ok(end)) = (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end))
+        else {
             return Err(format!("时间窗口「{}–{}」格式无效", w.start, w.end));
         };
-        if end <= start {
-            return Err(format!("时间窗口「{}–{}」结束必须晚于开始", w.start, w.end));
+        // V1.2.2 BUG-10：允许跨午夜窗口（如 22:00–02:00），仅拒绝零时长窗口。
+        if end == start {
+            return Err(format!("时间窗口「{}–{}」不能为同一时刻", w.start, w.end));
         }
         match w.every_days {
             Some(n) => {
@@ -191,7 +247,9 @@ pub fn save_routine(routine: Routine, state: State<AppState>) -> Result<Routine,
         Some(existing) => *existing = r.clone(),
         None => routines.push(r.clone()),
     }
-    storage.save_routines(&routines).map_err(|e| e.to_string())?;
+    storage
+        .save_routines(&routines)
+        .map_err(|e| e.to_string())?;
     Ok(r)
 }
 
@@ -206,7 +264,9 @@ pub fn delete_routine(id: String, state: State<AppState>) -> Result<(), String> 
             r.updated_at = now.clone();
         }
     }
-    storage.save_routines(&routines).map_err(|e| e.to_string())?;
+    storage
+        .save_routines(&routines)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -347,7 +407,12 @@ fn build_long_task_archive_entry(
     let mut noted: Vec<&LongTaskSession> = sessions
         .iter()
         .copied()
-        .filter(|s| s.note.as_deref().map(|n| !n.trim().is_empty()).unwrap_or(false))
+        .filter(|s| {
+            s.note
+                .as_deref()
+                .map(|n| !n.trim().is_empty())
+                .unwrap_or(false)
+        })
         .collect();
     noted.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     let note_lines: Vec<String> = noted
@@ -355,10 +420,17 @@ fn build_long_task_archive_entry(
         .filter_map(|s| {
             let started = timeutil::parse_utc(&s.started_at).ok()?;
             let hm = timeutil::fmt_local_time(&started, tz);
-            Some(format!("{hm} {}", s.note.as_deref().unwrap_or_default().trim()))
+            Some(format!(
+                "{hm} {}",
+                s.note.as_deref().unwrap_or_default().trim()
+            ))
         })
         .collect();
-    let note = if note_lines.is_empty() { None } else { Some(note_lines.join("\n")) };
+    let note = if note_lines.is_empty() {
+        None
+    } else {
+        Some(note_lines.join("\n"))
+    };
 
     let total_ms: i64 = sessions.iter().map(|s| s.duration_ms.max(0)).sum();
     let duration_minutes = (((total_ms as f64) / 60_000.0).round() as i64).max(1);
@@ -376,23 +448,39 @@ fn build_long_task_archive_entry(
 }
 
 /// 重建式聚合：删除该任务在某天的既有 longtask 条目，再按剩余有效会话重建。
-fn sync_long_task_archive_day(storage: &mut Storage, task: &LongTask, date: &str) -> Result<(), String> {
-    let tz = storage.read_config().map_err(|e| e.to_string())?.timezone.clone();
+fn sync_long_task_archive_day(
+    storage: &mut Storage,
+    task: &LongTask,
+    date: &str,
+) -> Result<(), String> {
+    let tz = storage
+        .read_config()
+        .map_err(|e| e.to_string())?
+        .timezone
+        .clone();
     let month = month_of(date);
-    let mut archive = storage.load_archive_month(&month).map_err(|e| e.to_string())?;
-    let day = archive.days.entry(date.to_string()).or_insert_with(|| ArchiveDay {
-        entries: vec![],
-        summary: None,
-        updated_at: timeutil::now_utc_string(),
-    });
+    let mut archive = storage
+        .load_archive_month(&month)
+        .map_err(|e| e.to_string())?;
+    let day = archive
+        .days
+        .entry(date.to_string())
+        .or_insert_with(|| ArchiveDay {
+            entries: vec![],
+            summary: None,
+            updated_at: timeutil::now_utc_string(),
+        });
 
     let existing_id = day
         .entries
         .iter()
-        .find(|e| e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str()))
+        .find(|e| {
+            e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str())
+        })
         .map(|e| e.id.clone());
-    day.entries
-        .retain(|e| !(e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str())));
+    day.entries.retain(|e| {
+        !(e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str()))
+    });
 
     let sessions: Vec<&LongTaskSession> = task
         .sessions
@@ -406,7 +494,9 @@ fn sync_long_task_archive_day(storage: &mut Storage, task: &LongTask, date: &str
     }
     day.entries.sort_by(|a, b| a.done_at.cmp(&b.done_at));
     day.updated_at = timeutil::now_utc_string();
-    storage.save_archive_month(&archive).map_err(|e| e.to_string())?;
+    storage
+        .save_archive_month(&archive)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -420,8 +510,13 @@ fn backfill_long_task_archives(storage: &mut Storage, data: &AppData) -> Result<
             if s.deleted_at.is_some() {
                 continue;
             }
-            let Ok(date) = long_task_session_date(s, tz) else { continue };
-            grouped.entry((idx, task.id.clone(), date)).or_default().push(s);
+            let Ok(date) = long_task_session_date(s, tz) else {
+                continue;
+            };
+            grouped
+                .entry((idx, task.id.clone(), date))
+                .or_default()
+                .push(s);
         }
     }
 
@@ -429,22 +524,28 @@ fn backfill_long_task_archives(storage: &mut Storage, data: &AppData) -> Result<
     for ((idx, _task_id, date), sessions) in grouped {
         let task = &data.long_tasks[idx];
         let month = month_of(&date);
-        let mut archive = storage.load_archive_month(&month).map_err(|e| e.to_string())?;
-        let day = archive.days.entry(date.clone()).or_insert_with(|| ArchiveDay {
-            entries: vec![],
-            summary: None,
-            updated_at: timeutil::now_utc_string(),
+        let mut archive = storage
+            .load_archive_month(&month)
+            .map_err(|e| e.to_string())?;
+        let day = archive
+            .days
+            .entry(date.clone())
+            .or_insert_with(|| ArchiveDay {
+                entries: vec![],
+                summary: None,
+                updated_at: timeutil::now_utc_string(),
+            });
+        let missing = !day.entries.iter().any(|e| {
+            e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str())
         });
-        let missing = !day
-            .entries
-            .iter()
-            .any(|e| e.source == ArchiveSource::LongTask && e.source_id.as_deref() == Some(task.id.as_str()));
         if missing {
             if let Some(entry) = build_long_task_archive_entry(task, &sessions, tz, None)? {
                 day.entries.push(entry);
                 day.entries.sort_by(|a, b| a.done_at.cmp(&b.done_at));
                 day.updated_at = timeutil::now_utc_string();
-                storage.save_archive_month(&archive).map_err(|e| e.to_string())?;
+                storage
+                    .save_archive_month(&archive)
+                    .map_err(|e| e.to_string())?;
                 created += 1;
             }
         }
@@ -467,7 +568,10 @@ pub struct AddLongTaskSessionInput {
 }
 
 #[tauri::command]
-pub fn add_long_task_session(input: AddLongTaskSessionInput, state: State<AppState>) -> Result<LongTaskSession, String> {
+pub fn add_long_task_session(
+    input: AddLongTaskSessionInput,
+    state: State<AppState>,
+) -> Result<LongTaskSession, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let tz = config.timezone.clone();
@@ -478,7 +582,11 @@ pub fn add_long_task_session(input: AddLongTaskSessionInput, state: State<AppSta
         .ok_or_else(|| "长期任务不存在或已删除".to_string())?;
 
     // 幂等：同 sessionId（含软删除）已存在时直接返回，并补偿归档对账。
-    if let Some(existing) = tasks[idx].sessions.iter().find(|s| s.id == input.session_id) {
+    if let Some(existing) = tasks[idx]
+        .sessions
+        .iter()
+        .find(|s| s.id == input.session_id)
+    {
         let out = existing.clone();
         let date = long_task_session_date(existing, &tz)?;
         let task = tasks[idx].clone();
@@ -488,14 +596,14 @@ pub fn add_long_task_session(input: AddLongTaskSessionInput, state: State<AppSta
 
     let started = timeutil::normalize_to_utc(&input.started_at).map_err(|e| e.to_string())?;
     let ended = timeutil::normalize_to_utc(&input.ended_at).map_err(|e| e.to_string())?;
-    // 前端提交的 durationMs 仅作参考；后端以两端时间差复核覆盖（防时钟漂移）。
-    let _frontend_duration_ms = input.duration_ms;
     let started_utc = timeutil::parse_utc(&started).map_err(|e| e.to_string())?;
     let ended_utc = timeutil::parse_utc(&ended).map_err(|e| e.to_string())?;
     if ended_utc < started_utc {
         return Err("结束时间不能早于开始时间".to_string());
     }
-    let duration_ms = (ended_utc - started_utc).num_milliseconds();
+    // V1.2.2 BUG-03：durationMs 是前端累计的「有效投入时长」（已扣除暂停/应用关闭期间），
+    // 作为权威值落库；endedAt-startedAt 仅用于校验时间先后，不再用于覆盖时长。
+    let duration_ms = input.duration_ms;
     if duration_ms <= 0 {
         return Err("本次用时过短，未记录会话".to_string());
     }
@@ -575,16 +683,26 @@ pub struct LongTaskSessionRef {
 }
 
 #[tauri::command]
-pub fn delete_long_task_session(input: LongTaskSessionRef, state: State<AppState>) -> Result<(), String> {
+pub fn delete_long_task_session(
+    input: LongTaskSessionRef,
+    state: State<AppState>,
+) -> Result<(), String> {
     set_long_task_session_deleted(input, true, state)
 }
 
 #[tauri::command]
-pub fn undelete_long_task_session(input: LongTaskSessionRef, state: State<AppState>) -> Result<(), String> {
+pub fn undelete_long_task_session(
+    input: LongTaskSessionRef,
+    state: State<AppState>,
+) -> Result<(), String> {
     set_long_task_session_deleted(input, false, state)
 }
 
-fn set_long_task_session_deleted(input: LongTaskSessionRef, deleted: bool, state: State<AppState>) -> Result<(), String> {
+fn set_long_task_session_deleted(
+    input: LongTaskSessionRef,
+    deleted: bool,
+    state: State<AppState>,
+) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let tz = config.timezone.clone();
@@ -610,6 +728,91 @@ fn set_long_task_session_deleted(input: LongTaskSessionRef, deleted: bool, state
 }
 
 // ---------------------------------------------------------------------------
+// V1.2.2：归档页删除长期任务聚合条目（同步软删除当天会话，统计随之更新）
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLongTaskArchiveDayInput {
+    pub task_id: String,
+    /// 归档条目所属本地日期 YYYY-MM-DD。
+    pub date: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLongTaskArchiveDayResult {
+    pub deleted_session_ids: Vec<String>,
+}
+
+#[tauri::command]
+pub fn delete_long_task_archive_day(
+    input: DeleteLongTaskArchiveDayInput,
+    state: State<AppState>,
+) -> Result<DeleteLongTaskArchiveDayResult, String> {
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let config = storage.read_config().map_err(|e| e.to_string())?;
+    let tz = config.timezone.clone();
+    let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let idx = tasks
+        .iter()
+        .position(|t| t.id == input.task_id)
+        .ok_or_else(|| "长期任务不存在".to_string())?;
+
+    let now = timeutil::now_utc_string();
+    let mut deleted_session_ids = Vec::new();
+    for s in tasks[idx].sessions.iter_mut() {
+        if s.deleted_at.is_none()
+            && long_task_session_date(s, &tz).ok().as_deref() == Some(input.date.as_str())
+        {
+            s.deleted_at = Some(now.clone());
+            s.updated_at = now.clone();
+            deleted_session_ids.push(s.id.clone());
+        }
+    }
+    tasks[idx].updated_at = now;
+    let task = tasks[idx].clone();
+    storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    sync_long_task_archive_day(&mut storage, &task, &input.date)?;
+    Ok(DeleteLongTaskArchiveDayResult {
+        deleted_session_ids,
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndeleteLongTaskArchiveDayInput {
+    pub task_id: String,
+    pub date: String,
+    pub session_ids: Vec<String>,
+}
+
+#[tauri::command]
+pub fn undelete_long_task_archive_day(
+    input: UndeleteLongTaskArchiveDayInput,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
+    let idx = tasks
+        .iter()
+        .position(|t| t.id == input.task_id)
+        .ok_or_else(|| "长期任务不存在".to_string())?;
+    let now = timeutil::now_utc_string();
+    for s in tasks[idx].sessions.iter_mut() {
+        if input.session_ids.contains(&s.id) && s.deleted_at.is_some() {
+            s.deleted_at = None;
+            s.updated_at = now.clone();
+        }
+    }
+    tasks[idx].updated_at = now;
+    let task = tasks[idx].clone();
+    storage.save_long_tasks(&tasks).map_err(|e| e.to_string())?;
+    sync_long_task_archive_day(&mut storage, &task, &input.date)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // 归档
 // ---------------------------------------------------------------------------
 
@@ -629,12 +832,17 @@ fn persist_archive(storage: &mut Storage, entry: ArchiveEntry) -> Result<Archive
     }
     let date = timeutil::fmt_local_date(&done_utc, &config.timezone);
     let month = month_of(&date);
-    let mut archive = storage.load_archive_month(&month).map_err(|err| err.to_string())?;
-    let day = archive.days.entry(date.clone()).or_insert_with(|| ArchiveDay {
-        entries: vec![],
-        summary: None,
-        updated_at: timeutil::now_utc_string(),
-    });
+    let mut archive = storage
+        .load_archive_month(&month)
+        .map_err(|err| err.to_string())?;
+    let day = archive
+        .days
+        .entry(date.clone())
+        .or_insert_with(|| ArchiveDay {
+            entries: vec![],
+            summary: None,
+            updated_at: timeutil::now_utc_string(),
+        });
     day.entries.retain(|x| x.id != e.id);
     // V3.0 B5：当日同源去重（非手动来源 + 有 sourceId 时幂等返回已有条目），
     // 防止「日常窗口内重复完成」在时间轴/归档产生多条同源记录。
@@ -652,7 +860,9 @@ fn persist_archive(storage: &mut Storage, entry: ArchiveEntry) -> Result<Archive
     day.entries.push(e.clone());
     day.entries.sort_by(|a, b| a.done_at.cmp(&b.done_at));
     day.updated_at = timeutil::now_utc_string();
-    storage.save_archive_month(&archive).map_err(|err| err.to_string())?;
+    storage
+        .save_archive_month(&archive)
+        .map_err(|err| err.to_string())?;
     Ok(e)
 }
 
@@ -661,8 +871,17 @@ fn persist_archive(storage: &mut Storage, entry: ArchiveEntry) -> Result<Archive
 pub fn archive_entry(entry: ArchiveEntry, state: State<AppState>) -> Result<ArchiveEntry, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let saved = persist_archive(&mut storage, entry)?;
-    let hooks_enabled = state.config.lock().map(|c| c.hooks.enabled).unwrap_or(false);
-    dispatch_hook_if_enabled(hooks_enabled, storage.data_dir(), "on_archive_entry_add", &saved);
+    let hooks_enabled = state
+        .config
+        .lock()
+        .map(|c| c.hooks.enabled)
+        .unwrap_or(false);
+    dispatch_hook_if_enabled(
+        hooks_enabled,
+        storage.data_dir(),
+        "on_archive_entry_add",
+        &saved,
+    );
     Ok(saved)
 }
 
@@ -681,7 +900,10 @@ pub struct CompleteCandidateInput {
 }
 
 #[tauri::command]
-pub fn complete_candidate(input: CompleteCandidateInput, state: State<AppState>) -> Result<ArchiveEntry, String> {
+pub fn complete_candidate(
+    input: CompleteCandidateInput,
+    state: State<AppState>,
+) -> Result<ArchiveEntry, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let now = timeutil::now_utc_string();
@@ -705,8 +927,17 @@ pub fn complete_candidate(input: CompleteCandidateInput, state: State<AppState>)
         done_at: now.clone(),
     };
     let saved = persist_archive(&mut storage, entry)?;
-    let hooks_enabled = state.config.lock().map(|c| c.hooks.enabled).unwrap_or(false);
-    dispatch_hook_if_enabled(hooks_enabled, storage.data_dir(), "on_archive_entry_add", &saved);
+    let hooks_enabled = state
+        .config
+        .lock()
+        .map(|c| c.hooks.enabled)
+        .unwrap_or(false);
+    dispatch_hook_if_enabled(
+        hooks_enabled,
+        storage.data_dir(),
+        "on_archive_entry_add",
+        &saved,
+    );
 
     // 非重复实例：标记来源完成；重复实例（seriesId 非空）不改序列。
     if input.series_id.is_none() {
@@ -746,21 +977,33 @@ pub fn update_archive_day(
     payload: ArchiveDay,
     state: State<AppState>,
 ) -> Result<ArchiveDay, String> {
+    // BUG-27：校验日期 key，拒绝写入垃圾 day key。
+    timeutil::parse_date(&date).map_err(|e| e.to_string())?;
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let month = month_of(&date);
-    let mut archive = storage.load_archive_month(&month).map_err(|e| e.to_string())?;
+    let mut archive = storage
+        .load_archive_month(&month)
+        .map_err(|e| e.to_string())?;
     let mut day = payload;
     day.updated_at = timeutil::now_utc_string();
     archive.days.insert(date.clone(), day.clone());
-    storage.save_archive_month(&archive).map_err(|e| e.to_string())?;
+    storage
+        .save_archive_month(&archive)
+        .map_err(|e| e.to_string())?;
     Ok(day)
 }
 
 /// 读取指定月份归档（归档页翻月用）。
 #[tauri::command]
 pub fn get_archive_month(month: String, state: State<AppState>) -> Result<ArchiveFile, String> {
+    // BUG-27：白名单校验月份格式，拒绝路径穿越类参数。
+    if !is_valid_month(&month) {
+        return Err("月份参数无效".to_string());
+    }
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-    storage.load_archive_month(&month).map_err(|e| e.to_string())
+    storage
+        .load_archive_month(&month)
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +1030,9 @@ pub fn set_config(
     }
     // V3.1 T4：仅落盘 + 递增 generation；单一 config_applier 线程串行收敛
     // 热键 / 移动端服务 / Git 自动提交，快速连续保存不会并发重启。
-    state.config_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state
+        .config_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(config)
 }
 
@@ -830,7 +1075,11 @@ pub fn parse_nl(text: String, state: State<AppState>) -> Result<NlpEvent, String
 
 /// `get_calendar(start, end)`：区间内事件实例（含重复展开）+ 日常窗口。
 #[tauri::command]
-pub fn get_calendar(start: String, end: String, state: State<AppState>) -> Result<CalendarData, String> {
+pub fn get_calendar(
+    start: String,
+    end: String,
+    state: State<AppState>,
+) -> Result<CalendarData, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let data = storage.load_all().map_err(|e| e.to_string())?;
     let from = timeutil::parse_date(&start).map_err(|e| e.to_string())?;
@@ -865,12 +1114,23 @@ pub fn get_calendar(start: String, end: String, state: State<AppState>) -> Resul
         };
     }
 
-    Ok(CalendarData { occurrences, routine_windows })
+    Ok(CalendarData {
+        occurrences,
+        routine_windows,
+    })
 }
 
 /// `search(query)`：标题/标签/日期范围组合筛选。
 #[tauri::command]
 pub fn search_data(query: SearchQuery, state: State<AppState>) -> Result<SearchResult, String> {
+    // BUG-23：日期范围倒置给出明确错误，而不是静默返回空结果。
+    if let (Some(f), Some(t)) = (query.date_from.as_deref(), query.date_to.as_deref()) {
+        let from = timeutil::parse_date(f).map_err(|e| e.to_string())?;
+        let to = timeutil::parse_date(t).map_err(|e| e.to_string())?;
+        if from > to {
+            return Err("开始日期不能晚于结束日期".to_string());
+        }
+    }
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let data = storage.load_all().map_err(|e| e.to_string())?;
     Ok(schedule_core::search(&data, &query))
@@ -889,14 +1149,29 @@ pub fn get_stats(days: i64, state: State<AppState>) -> Result<StatsResult, Strin
     let to = timeutil::parse_date(&timeutil::today_string(tz)).map_err(|e| e.to_string())?;
     let from = to - Duration::days((days.max(1) - 1).min(3660));
     let archive = storage
-        .load_archive_range(&month_of(&timeutil::fmt_date(&from)), &month_of(&timeutil::fmt_date(&to)))
+        .load_archive_range(
+            &month_of(&timeutil::fmt_date(&from)),
+            &month_of(&timeutil::fmt_date(&to)),
+        )
         .map_err(|e| e.to_string())?;
-    Ok(compute_stats(&archive, &data.routines, &data.events, &data.tasks, &data.long_tasks, from, to))
+    Ok(compute_stats(
+        &archive,
+        &data.routines,
+        &data.events,
+        &data.tasks,
+        &data.long_tasks,
+        from,
+        to,
+    ))
 }
 
 /// `get_review(from, to)`：日/周复盘视图。
 #[tauri::command]
-pub fn get_review(from: String, to: String, state: State<AppState>) -> Result<ReviewResult, String> {
+pub fn get_review(
+    from: String,
+    to: String,
+    state: State<AppState>,
+) -> Result<ReviewResult, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let data = storage.load_all().map_err(|e| e.to_string())?;
     let f = timeutil::parse_date(&from).map_err(|e| e.to_string())?;
@@ -904,7 +1179,15 @@ pub fn get_review(from: String, to: String, state: State<AppState>) -> Result<Re
     let archive = storage
         .load_archive_range(&month_of(&from), &month_of(&to))
         .map_err(|e| e.to_string())?;
-    Ok(compute_review(&archive, &data.routines, &data.events, &data.tasks, &data.long_tasks, f, t))
+    Ok(compute_review(
+        &archive,
+        &data.routines,
+        &data.events,
+        &data.tasks,
+        &data.long_tasks,
+        f,
+        t,
+    ))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -979,21 +1262,13 @@ fn delete_tag_color(colors: &mut BTreeMap<String, String>, tag: &str) -> bool {
     colors.remove(tag).is_some()
 }
 
-/// `rename_tag(old, new)`：跨事件/日常/浮动事项重命名标签；同步迁移颜色映射（V3.1 U4）。
-#[tauri::command]
-pub fn rename_tag(old: String, new: String, state: State<AppState>) -> Result<(), String> {
-    let new = new.trim().to_string();
-    if new.is_empty() {
-        return Err("新标签名不能为空".to_string());
-    }
-    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-
+/// `rename_tag(old, new)`：跨事件/日常/浮动/长期任务重命名标签；同步迁移颜色映射（V3.1 U4）。
+/// BUG-16：任一文件写失败由命令层整体回滚。
+fn rename_tag_impl(storage: &mut Storage, old: &str, new: &str) -> Result<bool, String> {
     let mut config = storage.read_config().map_err(|e| e.to_string())?;
-    if rename_tag_color(&mut config.tag_colors, &old, &new) {
+    let color_changed = rename_tag_color(&mut config.tag_colors, old, new);
+    if color_changed {
         storage.save_config(&config).map_err(|e| e.to_string())?;
-        if let Ok(mut cfg) = state.config.lock() {
-            *cfg = config;
-        }
     }
 
     let mut events = storage.read_events().map_err(|e| e.to_string())?;
@@ -1001,7 +1276,7 @@ pub fn rename_tag(old: String, new: String, state: State<AppState>) -> Result<()
     for e in events.iter_mut() {
         for t in e.tags.iter_mut() {
             if *t == old {
-                *t = new.clone();
+                *t = new.to_string();
                 e_changed = true;
             }
         }
@@ -1015,13 +1290,15 @@ pub fn rename_tag(old: String, new: String, state: State<AppState>) -> Result<()
     for r in routines.iter_mut() {
         for t in r.tags.iter_mut() {
             if *t == old {
-                *t = new.clone();
+                *t = new.to_string();
                 r_changed = true;
             }
         }
     }
     if r_changed {
-        storage.save_routines(&routines).map_err(|e| e.to_string())?;
+        storage
+            .save_routines(&routines)
+            .map_err(|e| e.to_string())?;
     }
 
     let mut tasks = storage.read_tasks().map_err(|e| e.to_string())?;
@@ -1029,7 +1306,7 @@ pub fn rename_tag(old: String, new: String, state: State<AppState>) -> Result<()
     for t in tasks.iter_mut() {
         for tag in t.tags.iter_mut() {
             if *tag == old {
-                *tag = new.clone();
+                *tag = new.to_string();
                 t_changed = true;
             }
         }
@@ -1043,35 +1320,62 @@ pub fn rename_tag(old: String, new: String, state: State<AppState>) -> Result<()
     for lt in long_tasks.iter_mut() {
         for tag in lt.tags.iter_mut() {
             if *tag == old {
-                *tag = new.clone();
+                *tag = new.to_string();
                 lt_changed = true;
             }
         }
     }
     if lt_changed {
-        storage.save_long_tasks(&long_tasks).map_err(|e| e.to_string())?;
+        storage
+            .save_long_tasks(&long_tasks)
+            .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(color_changed)
 }
 
-/// `delete_tag(tag)`：跨事件/日常/浮动事项移除标签；同步删除颜色映射（V3.1 U4）。
 #[tauri::command]
-pub fn delete_tag(tag: String, state: State<AppState>) -> Result<(), String> {
+pub fn rename_tag(old: String, new: String, state: State<AppState>) -> Result<(), String> {
+    let new = new.trim().to_string();
+    if new.is_empty() {
+        return Err("新标签名不能为空".to_string());
+    }
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-
-    let mut config = storage.read_config().map_err(|e| e.to_string())?;
-    if delete_tag_color(&mut config.tag_colors, &tag) {
-        storage.save_config(&config).map_err(|e| e.to_string())?;
-        if let Ok(mut cfg) = state.config.lock() {
-            *cfg = config;
+    let dir = storage.data_dir().to_path_buf();
+    let snap = snapshot_data_files(&dir)?;
+    match rename_tag_impl(&mut storage, &old, &new) {
+        Ok(color_changed) => {
+            cleanup_snapshot(&snap);
+            if color_changed {
+                let config = storage.read_config().map_err(|e| e.to_string())?;
+                if let Ok(mut cfg) = state.config.lock() {
+                    *cfg = config;
+                }
+            }
+            Ok(())
         }
+        Err(e) => {
+            let _ = restore_data_files(&snap, &dir);
+            *storage = Storage::new(dir);
+            cleanup_snapshot(&snap);
+            Err(format!("重命名标签失败，已回滚：{e}"))
+        }
+    }
+}
+
+/// `delete_tag(tag)`：跨事件/日常/浮动/长期任务移除标签；同步删除颜色映射（V3.1 U4）。
+/// BUG-16：任一文件写失败由命令层整体回滚。
+fn delete_tag_impl(storage: &mut Storage, tag: &str) -> Result<bool, String> {
+    let mut config = storage.read_config().map_err(|e| e.to_string())?;
+    let color_changed = delete_tag_color(&mut config.tag_colors, tag);
+    if color_changed {
+        storage.save_config(&config).map_err(|e| e.to_string())?;
     }
 
     let mut events = storage.read_events().map_err(|e| e.to_string())?;
     let mut e_changed = false;
     for e in events.iter_mut() {
         let before = e.tags.len();
-        e.tags.retain(|t| t != &tag);
+        e.tags.retain(|t| t != tag);
         if e.tags.len() != before {
             e_changed = true;
         }
@@ -1084,20 +1388,22 @@ pub fn delete_tag(tag: String, state: State<AppState>) -> Result<(), String> {
     let mut r_changed = false;
     for r in routines.iter_mut() {
         let before = r.tags.len();
-        r.tags.retain(|t| t != &tag);
+        r.tags.retain(|t| t != tag);
         if r.tags.len() != before {
             r_changed = true;
         }
     }
     if r_changed {
-        storage.save_routines(&routines).map_err(|e| e.to_string())?;
+        storage
+            .save_routines(&routines)
+            .map_err(|e| e.to_string())?;
     }
 
     let mut tasks = storage.read_tasks().map_err(|e| e.to_string())?;
     let mut t_changed = false;
     for t in tasks.iter_mut() {
         let before = t.tags.len();
-        t.tags.retain(|x| x != &tag);
+        t.tags.retain(|x| x != tag);
         if t.tags.len() != before {
             t_changed = true;
         }
@@ -1110,22 +1416,122 @@ pub fn delete_tag(tag: String, state: State<AppState>) -> Result<(), String> {
     let mut lt_changed = false;
     for lt in long_tasks.iter_mut() {
         let before = lt.tags.len();
-        lt.tags.retain(|x| x != &tag);
+        lt.tags.retain(|x| x != tag);
         if lt.tags.len() != before {
             lt_changed = true;
         }
     }
     if lt_changed {
-        storage.save_long_tasks(&long_tasks).map_err(|e| e.to_string())?;
+        storage
+            .save_long_tasks(&long_tasks)
+            .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(color_changed)
+}
+
+#[tauri::command]
+pub fn delete_tag(tag: String, state: State<AppState>) -> Result<(), String> {
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let dir = storage.data_dir().to_path_buf();
+    let snap = snapshot_data_files(&dir)?;
+    match delete_tag_impl(&mut storage, &tag) {
+        Ok(color_changed) => {
+            cleanup_snapshot(&snap);
+            if color_changed {
+                let config = storage.read_config().map_err(|e| e.to_string())?;
+                if let Ok(mut cfg) = state.config.lock() {
+                    *cfg = config;
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = restore_data_files(&snap, &dir);
+            *storage = Storage::new(dir);
+            cleanup_snapshot(&snap);
+            Err(format!("删除标签失败，已回滚：{e}"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Phase 1：自定义数据目录 / 导入导出
 // ---------------------------------------------------------------------------
 
-const DATA_FILES: [&str; 6] = ["events.json", "routines.json", "tasks.json", "templates.json", "config.json", "long_tasks.json"];
+const DATA_FILES: [&str; 6] = [
+    "events.json",
+    "routines.json",
+    "tasks.json",
+    "templates.json",
+    "config.json",
+    "long_tasks.json",
+];
+
+/// BUG-04/15/16：多文件写操作的临时快照目录（用于失败回滚）。
+fn snapshot_data_files(src: &Path) -> Result<PathBuf, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let snap =
+        std::env::temp_dir().join(format!("schedule-snapshot-{}-{stamp}", std::process::id()));
+    fs::create_dir_all(snap.join("archive")).map_err(|e| e.to_string())?;
+    for f in DATA_FILES {
+        let s = src.join(f);
+        if s.exists() {
+            fs::copy(&s, snap.join(f)).map_err(|e| e.to_string())?;
+        }
+    }
+    let arc = src.join("archive");
+    if arc.exists() {
+        for entry in fs::read_dir(&arc).map_err(|e| e.to_string())? {
+            let p = entry.map_err(|e| e.to_string())?.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("json") {
+                if let Some(name) = p.file_name().and_then(|x| x.to_str()) {
+                    fs::copy(&p, snap.join("archive").join(name)).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+    }
+    Ok(snap)
+}
+
+fn restore_data_files(snap: &Path, dst: &Path) -> Result<(), String> {
+    // 先清除目标数据文件，再整体回滚快照，避免写入过程新增的文件残留。
+    for f in DATA_FILES {
+        let _ = fs::remove_file(dst.join(f));
+    }
+    let arc = dst.join("archive");
+    if arc.exists() {
+        for entry in fs::read_dir(&arc).map_err(|e| e.to_string())? {
+            let p = entry.map_err(|e| e.to_string())?.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("json") {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+    fs::create_dir_all(&arc).map_err(|e| e.to_string())?;
+    for f in DATA_FILES {
+        let s = snap.join(f);
+        if s.exists() {
+            fs::copy(&s, dst.join(f)).map_err(|e| e.to_string())?;
+        }
+    }
+    let snap_arc = snap.join("archive");
+    if snap_arc.exists() {
+        for entry in fs::read_dir(&snap_arc).map_err(|e| e.to_string())? {
+            let p = entry.map_err(|e| e.to_string())?.path();
+            if let Some(name) = p.file_name().and_then(|x| x.to_str()) {
+                fs::copy(&p, arc.join(name)).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_snapshot(snap: &Path) {
+    let _ = fs::remove_dir_all(snap);
+}
 
 /// `pick_directory()`：原生文件夹选择（用于导入/导出/自定义数据目录）。
 #[tauri::command]
@@ -1167,7 +1573,9 @@ pub fn set_data_dir(path: String, state: State<AppState>) -> Result<Config, Stri
     new_storage.ensure().map_err(|e| e.to_string())?;
     let mut config = new_storage.read_config().unwrap_or_default();
     config.data_dir = path.clone();
-    new_storage.save_config(&config).map_err(|e| e.to_string())?;
+    new_storage
+        .save_config(&config)
+        .map_err(|e| e.to_string())?;
 
     {
         let mut storage = state.storage.lock().map_err(|_| lock_err())?;
@@ -1177,7 +1585,9 @@ pub fn set_data_dir(path: String, state: State<AppState>) -> Result<Config, Stri
         *cfg = config.clone();
     }
     // 数据目录切换后，让移动端服务 / Git 自动提交收敛到新目录。
-    state.config_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    state
+        .config_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // 指针文件：自定义目录时写入，恢复默认时删除。
     if path == "auto" {
         let _ = fs::remove_file(base.join("data_dir.txt"));
@@ -1237,25 +1647,34 @@ pub fn import_data(src_dir: String, state: State<AppState>) -> Result<ImportResu
     let src = PathBuf::from(src_dir);
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
 
-    // 先校验源目录数据（含迁移）。
+    // ---- BUG-04 第一阶段：全量校验源目录（含 templates 与全部 archive 月份）。 ----
     let mut src_storage = Storage::new(src.clone());
     let src_data = src_storage.load_all().map_err(|e| e.to_string())?;
-
-    let cur_data_dir = storage.read_config().map_err(|e| e.to_string())?.data_dir.clone();
-    let mut config = src_data.config.clone();
-    config.data_dir = cur_data_dir;
-    config.version = schedule_core::CURRENT_VERSION;
-
-    storage.save_events(&src_data.events).map_err(|e| e.to_string())?;
-    storage.save_routines(&src_data.routines).map_err(|e| e.to_string())?;
-    storage.save_tasks(&src_data.tasks).map_err(|e| e.to_string())?;
-    storage.save_long_tasks(&src_data.long_tasks).map_err(|e| e.to_string())?;
+    // BUG-12/22：导入路径同样校验事件区间与全天日期；日常窗口走统一校验。
+    for ev in &src_data.events {
+        if ev.all_day {
+            timeutil::parse_date(&ev.start).map_err(|e| format!("全天事件日期无效：{e}"))?;
+            if let Some(end) = &ev.end {
+                timeutil::parse_date(end).map_err(|e| format!("全天事件日期无效：{e}"))?;
+                if end < &ev.start {
+                    return Err("全天事件结束日期不能早于开始日期".to_string());
+                }
+            }
+        } else {
+            let s = timeutil::parse_utc(&ev.start).map_err(|e| e.to_string())?;
+            if let Some(end) = &ev.end {
+                let e = timeutil::parse_utc(end).map_err(|err| err.to_string())?;
+                if e <= s {
+                    return Err("事件结束时间不能早于或等于开始时间".to_string());
+                }
+            }
+        }
+    }
+    for rt in &src_data.routines {
+        validate_routine(rt)?;
+    }
     let templates = src_storage.read_templates().map_err(|e| e.to_string())?;
-    storage.save_templates(&templates).map_err(|e| e.to_string())?;
-    storage.save_config(&config).map_err(|e| e.to_string())?;
-
-    // 归档：复制全部月份。
-    let mut months = 0usize;
+    let mut src_months = Vec::new();
     let arc_src = src.join("archive");
     if arc_src.exists() {
         for entry in fs::read_dir(&arc_src).map_err(|e| e.to_string())? {
@@ -1263,13 +1682,68 @@ pub fn import_data(src_dir: String, state: State<AppState>) -> Result<ImportResu
             if p.extension().and_then(|x| x.to_str()) == Some("json") {
                 if let Some(name) = p.file_name().and_then(|x| x.to_str()) {
                     let month = name.trim_end_matches(".json").to_string();
-                    let af = src_storage.load_archive_month(&month).map_err(|e| e.to_string())?;
-                    storage.save_archive_month(&af).map_err(|e| e.to_string())?;
-                    months += 1;
+                    if !is_valid_month(&month) {
+                        return Err(format!("归档文件名无效：{name}"));
+                    }
+                    src_storage
+                        .load_archive_month(&month)
+                        .map_err(|e| e.to_string())?;
+                    src_months.push(month);
                 }
             }
         }
     }
+
+    // ---- 第二阶段：快照当前数据 → 全量写入；任一失败回滚。 ----
+    let cur_dir = storage.data_dir().to_path_buf();
+    let cur_data_dir = storage
+        .read_config()
+        .map_err(|e| e.to_string())?
+        .data_dir
+        .clone();
+    let mut config = src_data.config.clone();
+    config.data_dir = cur_data_dir;
+    config.version = schedule_core::CURRENT_VERSION;
+
+    let snap = snapshot_data_files(&cur_dir)?;
+    let mut do_import = || -> Result<usize, String> {
+        storage
+            .save_events(&src_data.events)
+            .map_err(|e| e.to_string())?;
+        storage
+            .save_routines(&src_data.routines)
+            .map_err(|e| e.to_string())?;
+        storage
+            .save_tasks(&src_data.tasks)
+            .map_err(|e| e.to_string())?;
+        storage
+            .save_long_tasks(&src_data.long_tasks)
+            .map_err(|e| e.to_string())?;
+        storage
+            .save_templates(&templates)
+            .map_err(|e| e.to_string())?;
+        storage.save_config(&config).map_err(|e| e.to_string())?;
+        let mut months = 0usize;
+        for month in &src_months {
+            let af = src_storage
+                .load_archive_month(month)
+                .map_err(|e| e.to_string())?;
+            storage.save_archive_month(&af).map_err(|e| e.to_string())?;
+            months += 1;
+        }
+        Ok(months)
+    };
+
+    let months = match do_import() {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = restore_data_files(&snap, &cur_dir);
+            *storage = Storage::new(cur_dir);
+            cleanup_snapshot(&snap);
+            return Err(format!("导入失败，已回滚：{e}"));
+        }
+    };
+    cleanup_snapshot(&snap);
 
     if let Ok(mut cfg) = state.config.lock() {
         *cfg = config;
@@ -1349,7 +1823,9 @@ pub fn save_template(template: Template, state: State<AppState>) -> Result<Templ
         Some(existing) => *existing = t.clone(),
         None => templates.push(t.clone()),
     }
-    storage.save_templates(&templates).map_err(|e| e.to_string())?;
+    storage
+        .save_templates(&templates)
+        .map_err(|e| e.to_string())?;
     Ok(t)
 }
 
@@ -1365,7 +1841,9 @@ pub fn delete_template(id: String, state: State<AppState>) -> Result<(), String>
             t.updated_at = now.clone();
         }
     }
-    storage.save_templates(&templates).map_err(|e| e.to_string())?;
+    storage
+        .save_templates(&templates)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1401,7 +1879,22 @@ pub fn apply_template_cmd(
         .find(|t| t.id == template_id && t.deleted_at.is_none())
         .cloned()
         .ok_or_else(|| "模板不存在".to_string())?;
-    apply_template(&mut storage, &t, &date, &config.timezone).map_err(|e| e.to_string())
+
+    // BUG-15：events / routines 两步写入任一失败则回滚，重试不会重复生成。
+    let dir = storage.data_dir().to_path_buf();
+    let snap = snapshot_data_files(&dir)?;
+    match apply_template(&mut storage, &t, &date, &config.timezone) {
+        Ok(r) => {
+            cleanup_snapshot(&snap);
+            Ok(r)
+        }
+        Err(e) => {
+            let _ = restore_data_files(&snap, &dir);
+            *storage = Storage::new(dir);
+            cleanup_snapshot(&snap);
+            Err(format!("应用模板失败，已回滚：{e}"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1422,7 +1915,11 @@ pub struct HooksStatus {
 pub fn hooks_status_cmd(state: State<AppState>) -> Result<HooksStatus, String> {
     let (enabled, dir) = {
         let storage = state.storage.lock().map_err(|_| lock_err())?;
-        let enabled = state.config.lock().map(|c| c.hooks.enabled).unwrap_or(false);
+        let enabled = state
+            .config
+            .lock()
+            .map(|c| c.hooks.enabled)
+            .unwrap_or(false);
         (enabled, storage.data_dir().to_path_buf())
     };
     let scripts = list_hooks(&dir);
@@ -1430,14 +1927,25 @@ pub fn hooks_status_cmd(state: State<AppState>) -> Result<HooksStatus, String> {
         enabled,
         directory: dir.display().to_string(),
         scripts,
-        supported_hooks: schedule_core::hooks::HOOK_NAMES.iter().map(|s| s.to_string()).collect(),
+        supported_hooks: schedule_core::hooks::HOOK_NAMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     })
 }
 
 /// `run_hook_test(hook, payload)`：手动触发一次钩子，返回各脚本执行结果（用于验证/导出输出）。
 #[tauri::command]
-pub fn run_hook_test(hook: String, payload: String, state: State<AppState>) -> Result<Vec<HookRunResult>, String> {
-    let enabled = state.config.lock().map(|c| c.hooks.enabled).unwrap_or(false);
+pub fn run_hook_test(
+    hook: String,
+    payload: String,
+    state: State<AppState>,
+) -> Result<Vec<HookRunResult>, String> {
+    let enabled = state
+        .config
+        .lock()
+        .map(|c| c.hooks.enabled)
+        .unwrap_or(false);
     if !enabled {
         return Err("脚本钩子未启用，请先在「脚本钩子」页开启".to_string());
     }
@@ -1521,7 +2029,10 @@ mod tests {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("schedule-app-test-{name}-{}-{nanos}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "schedule-app-test-{name}-{}-{nanos}",
+            std::process::id()
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1612,10 +2123,14 @@ mod tests {
         assert!(validate_long_task(&base).is_ok());
         let mut inverted = base.clone();
         inverted.due_date = "2025-02-01".to_string();
-        assert!(validate_long_task(&inverted).unwrap_err().contains("截止日期"));
+        assert!(validate_long_task(&inverted)
+            .unwrap_err()
+            .contains("截止日期"));
         let mut empty_title = base;
         empty_title.title = "  ".to_string();
-        assert!(validate_long_task(&empty_title).unwrap_err().contains("标题"));
+        assert!(validate_long_task(&empty_title)
+            .unwrap_err()
+            .contains("标题"));
     }
 
     fn lt_task(sessions: Vec<LongTaskSession>) -> LongTask {
@@ -1636,7 +2151,14 @@ mod tests {
         }
     }
 
-    fn lt_session(id: &str, started: &str, ended: &str, ms: i64, note: Option<&str>, deleted: bool) -> LongTaskSession {
+    fn lt_session(
+        id: &str,
+        started: &str,
+        ended: &str,
+        ms: i64,
+        note: Option<&str>,
+        deleted: bool,
+    ) -> LongTaskSession {
         LongTaskSession {
             id: id.to_string(),
             started_at: started.to_string(),
@@ -1662,11 +2184,27 @@ mod tests {
     #[test]
     fn test_build_long_task_archive_entry_aggregates_sessions() {
         let task = lt_task(vec![
-            lt_session("s1", "2025-01-15T09:00:00Z", "2025-01-15T09:20:00Z", 1_200_000, Some("A"), false),
-            lt_session("s2", "2025-01-15T10:00:00Z", "2025-01-15T10:10:00Z", 600_000, Some("B"), false),
+            lt_session(
+                "s1",
+                "2025-01-15T09:00:00Z",
+                "2025-01-15T09:20:00Z",
+                1_200_000,
+                Some("A"),
+                false,
+            ),
+            lt_session(
+                "s2",
+                "2025-01-15T10:00:00Z",
+                "2025-01-15T10:10:00Z",
+                600_000,
+                Some("B"),
+                false,
+            ),
         ]);
         let refs: Vec<&LongTaskSession> = task.sessions.iter().collect();
-        let entry = build_long_task_archive_entry(&task, &refs, "UTC", None).unwrap().unwrap();
+        let entry = build_long_task_archive_entry(&task, &refs, "UTC", None)
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.source, ArchiveSource::LongTask);
         assert_eq!(entry.source_id.as_deref(), Some("lt1"));
         assert_eq!(entry.duration_minutes, Some(30));
@@ -1681,8 +2219,22 @@ mod tests {
     fn test_sync_long_task_archive_day_rebuilds_merges_and_removes() {
         let (mut storage, _dir) = storage_with_utc("lt-archive-sync");
         let mut task = lt_task(vec![
-            lt_session("s1", "2025-01-15T09:00:00Z", "2025-01-15T09:20:00Z", 1_200_000, None, false),
-            lt_session("s2", "2025-01-15T10:00:00Z", "2025-01-15T10:10:00Z", 600_000, None, false),
+            lt_session(
+                "s1",
+                "2025-01-15T09:00:00Z",
+                "2025-01-15T09:20:00Z",
+                1_200_000,
+                None,
+                false,
+            ),
+            lt_session(
+                "s2",
+                "2025-01-15T10:00:00Z",
+                "2025-01-15T10:10:00Z",
+                600_000,
+                None,
+                false,
+            ),
         ]);
         sync_long_task_archive_day(&mut storage, &task, "2025-01-15").unwrap();
         let month = storage.load_archive_month("2025-01").unwrap();
@@ -1693,7 +2245,14 @@ mod tests {
         let time = entries[0].time.clone();
 
         // 增加一条会话 → 条目 id / time 保持，时长重算。
-        task.sessions.push(lt_session("s3", "2025-01-15T11:00:00Z", "2025-01-15T11:15:00Z", 900_000, None, false));
+        task.sessions.push(lt_session(
+            "s3",
+            "2025-01-15T11:00:00Z",
+            "2025-01-15T11:15:00Z",
+            900_000,
+            None,
+            false,
+        ));
         sync_long_task_archive_day(&mut storage, &task, "2025-01-15").unwrap();
         let month = storage.load_archive_month("2025-01").unwrap();
         let entries = &month.days["2025-01-15"].entries;
@@ -1708,15 +2267,23 @@ mod tests {
         }
         sync_long_task_archive_day(&mut storage, &task, "2025-01-15").unwrap();
         let month = storage.load_archive_month("2025-01").unwrap();
-        assert!(!month.days["2025-01-15"].entries.iter().any(|e| e.source == ArchiveSource::LongTask));
+        assert!(!month.days["2025-01-15"]
+            .entries
+            .iter()
+            .any(|e| e.source == ArchiveSource::LongTask));
     }
 
     #[test]
     fn test_backfill_long_task_archives_creates_only_missing_entries() {
         let (mut storage, _dir) = storage_with_utc("lt-backfill");
-        let task = lt_task(vec![
-            lt_session("s1", "2025-01-15T09:00:00Z", "2025-01-15T09:20:00Z", 1_200_000, Some("A"), false),
-        ]);
+        let task = lt_task(vec![lt_session(
+            "s1",
+            "2025-01-15T09:00:00Z",
+            "2025-01-15T09:20:00Z",
+            1_200_000,
+            Some("A"),
+            false,
+        )]);
         storage.save_long_tasks(&[task.clone()]).unwrap();
         let mut cfg = Config::default();
         cfg.timezone = "UTC".to_string();
@@ -1726,7 +2293,11 @@ mod tests {
             tasks: vec![],
             long_tasks: vec![task.clone()],
             config: cfg,
-            archive: ArchiveFile { version: schedule_core::CURRENT_VERSION, month: "2025-01".to_string(), days: Default::default() },
+            archive: ArchiveFile {
+                version: schedule_core::CURRENT_VERSION,
+                month: "2025-01".to_string(),
+                days: Default::default(),
+            },
         };
         // 首次回填创建条目。
         assert_eq!(backfill_long_task_archives(&mut storage, &data).unwrap(), 1);
@@ -1741,6 +2312,48 @@ mod tests {
         assert_eq!(backfill_long_task_archives(&mut storage, &data).unwrap(), 0);
         let month = storage.load_archive_month("2025-01").unwrap();
         assert_eq!(month.days["2025-01-15"].entries[0].title, "外部标题");
+    }
+
+    #[test]
+    fn test_all_day_event_date_is_validated() {
+        assert!(normalize_absolute("2025-01-15", true).is_ok());
+        assert!(normalize_absolute("not-a-date", true).is_err());
+    }
+
+    #[test]
+    fn test_snapshot_and_restore_data_files() {
+        let dir = tmp_dir("snapshot-rollback");
+        fs::write(dir.join("events.json"), "A").unwrap();
+        let snap = snapshot_data_files(&dir).unwrap();
+        fs::write(dir.join("events.json"), "B").unwrap();
+        restore_data_files(&snap, &dir).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("events.json")).unwrap(), "A");
+        cleanup_snapshot(&snap);
+    }
+
+    #[test]
+    fn test_cross_midnight_routine_window_is_accepted() {        let mut r = Routine {
+            id: "r1".to_string(),
+            title: "r".to_string(),
+            description: None,
+            time_windows: vec![schedule_core::TimeWindow {
+                days_of_week: vec![],
+                start: "22:00".to_string(),
+                end: "02:00".to_string(),
+                every_days: None,
+                anchor_date: None,
+            }],
+            duration_minutes: None,
+            tags: vec![],
+            priority: schedule_core::Priority::Normal,
+            enabled: true,
+            created_at: String::new(),
+            updated_at: String::new(),
+            deleted_at: None,
+        };
+        assert!(validate_routine(&r).is_ok());
+        r.time_windows[0].end = "22:00".to_string();
+        assert!(validate_routine(&r).unwrap_err().contains("同一时刻"));
     }
 
     #[test]
@@ -1772,7 +2385,7 @@ mod tests {
         assert!(validate_routine(&r).unwrap_err().contains("锚点"));
         r.time_windows[0].every_days = None;
         r.time_windows[0].anchor_date = None;
-        r.time_windows[0].end = "07:00".to_string();
-        assert!(validate_routine(&r).unwrap_err().contains("晚于"));
+        r.time_windows[0].end = "08:00".to_string(); // 与开始相同 → 零时长窗口。
+        assert!(validate_routine(&r).unwrap_err().contains("同一时刻"));
     }
 }

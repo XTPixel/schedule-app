@@ -26,13 +26,37 @@ pub struct NlpEvent {
     pub time: Option<String>,
 }
 
+/// 相对日期允许的最大偏移（天）：超过则视为解析失败并降级表单（BUG-01/24）。
+const MAX_REL_DAYS: i64 = 3660;
+
+/// 构造「未匹配」结果（保留原标题）。
+fn no_match(text: &str) -> NlpEvent {
+    let title = text.trim().to_string();
+    NlpEvent {
+        title: if title.is_empty() {
+            text.to_string()
+        } else {
+            title
+        },
+        start: String::new(),
+        end: None,
+        all_day: false,
+        matched: false,
+        date: None,
+        time: None,
+    }
+}
+
 /// 解析自然语言，参考时刻为 now_utc（本地日期由 tz 决定）。
 pub fn parse_natural_language(text: &str, tz_name: &str, now_utc: &DateTime<Utc>) -> NlpEvent {
     let tz = timeutil::resolve_tz(tz_name);
     let local = timeutil::to_local(now_utc, tz_name);
     let today = local.date;
 
-    let (date, date_lit) = extract_date(text, today);
+    // BUG-01/24/25：超大偏移 / 非法日期一律解析失败，避免 panic 与静默钳制。
+    let Ok((date, date_lit)) = extract_date(text, today) else {
+        return no_match(text);
+    };
     let (time, time_lit) = extract_time(text);
 
     let matched = date.is_some() || time.is_some();
@@ -44,7 +68,9 @@ pub fn parse_natural_language(text: &str, tz_name: &str, now_utc: &DateTime<Utc>
         title = title.replace(lit, " ");
     }
     // 去掉残留的时段词/介词/空白。
-    for p in ["凌晨", "早上", "早晨", "上午", "下午", "傍晚", "晚上", "中午", "正午", "的"] {
+    for p in [
+        "凌晨", "早上", "早晨", "上午", "下午", "傍晚", "晚上", "中午", "正午", "的",
+    ] {
         title = title.replace(p, " ");
     }
     title = title
@@ -56,18 +82,14 @@ pub fn parse_natural_language(text: &str, tz_name: &str, now_utc: &DateTime<Utc>
     let title = title.trim().to_string();
 
     if !matched {
-        return NlpEvent {
-            title: if title.is_empty() { text.trim().to_string() } else { title },
-            start: String::new(),
-            end: None,
-            all_day: false,
-            matched: false,
-            date: None,
-            time: None,
-        };
+        return no_match(text);
     }
 
-    let final_title = if title.is_empty() { text.trim().to_string() } else { title };
+    let final_title = if title.is_empty() {
+        text.trim().to_string()
+    } else {
+        title
+    };
 
     // 只有日期、无时间 → 全天事件。
     let date = date.unwrap_or(today);
@@ -101,8 +123,8 @@ pub fn parse_natural_language(text: &str, tz_name: &str, now_utc: &DateTime<Utc>
 // 日期识别
 // ---------------------------------------------------------------------------
 
-/// 返回 (目标日期, 匹配到的字面量)。
-fn extract_date(text: &str, today: NaiveDate) -> (Option<NaiveDate>, Option<&str>) {
+/// 返回 (目标日期, 匹配到的字面量)。越界 / 非法日期返回 Err，调用方降级表单。
+fn extract_date(text: &str, today: NaiveDate) -> Result<(Option<NaiveDate>, Option<&str>), ()> {
     // 相对天数。
     for (pat, delta) in [
         ("大后天", 3i64),
@@ -113,58 +135,69 @@ fn extract_date(text: &str, today: NaiveDate) -> (Option<NaiveDate>, Option<&str
         ("昨天", -1),
     ] {
         if text.contains(pat) {
-            return (Some(today + Duration::days(delta)), Some(pat));
+            return Ok((Some(today + Duration::days(delta)), Some(pat)));
         }
     }
 
-    // X天后 / X日后。
+    // X天后 / X日后（BUG-01/24：上界 3660 天，checked_add 防溢出）。
     if let Some((n, lit)) = find_number_suffix(text, &["天后", "日后", "天之后"]) {
-        return (Some(today + Duration::days(n as i64)), Some(lit));
+        if n < 0 || n > MAX_REL_DAYS {
+            return Err(());
+        }
+        let d = today.checked_add_signed(Duration::days(n)).ok_or(())?;
+        return Ok((Some(d), Some(lit)));
     }
     // X周后 / X星期后。
     if let Some((n, lit)) = find_number_suffix(text, &["周后", "星期后", "个星期后"]) {
-        return (Some(today + Duration::days(n as i64 * 7)), Some(lit));
+        if n < 0 || n > MAX_REL_DAYS / 7 {
+            return Err(());
+        }
+        let d = today.checked_add_signed(Duration::days(n * 7)).ok_or(())?;
+        return Ok((Some(d), Some(lit)));
     }
 
     // 下周X / 下星期X。
     if let Some((wd, lit)) = find_weekday(text, &["下个星期", "下星期", "下周"]) {
         let d = next_weekday_after(today, wd, 7);
-        return (Some(d), Some(lit));
+        return Ok((Some(d), Some(lit)));
     }
     // 本周X / 这周X（从今天起最近的该星期几，含今天）。
-    if let Some((wd, lit)) = find_weekday(text, &["这个星期", "这星期", "本周", "这周"]) {
-        return (Some(next_weekday_after(today, wd, 0)), Some(lit));
+    if let Some((wd, lit)) = find_weekday(text, &["这个星期", "这星期", "本周", "这周"])
+    {
+        return Ok((Some(next_weekday_after(today, wd, 0)), Some(lit)));
     }
     // 周X / 星期X / 礼拜X。
     if let Some((wd, lit)) = find_weekday(text, &["星期", "礼拜", "周"]) {
-        return (Some(next_weekday_after(today, wd, 0)), Some(lit));
+        return Ok((Some(next_weekday_after(today, wd, 0)), Some(lit)));
     }
 
-    // X月X日 / X月X号。
+    // X月X日 / X月X号（BUG-25：非法日期不再静默钳制，降级表单）。
     if let Some((d, lit)) = extract_month_day(text) {
         let y = today.year();
-        let mk = |y: i32| {
-            NaiveDate::from_ymd_opt(y, d.0, d.1)
-                .unwrap_or_else(|| NaiveDate::from_ymd_opt(y, d.0, d.1.min(28)).unwrap())
-        };
-        let candidate = mk(y);
+        let candidate = NaiveDate::from_ymd_opt(y, d.0, d.1).ok_or(())?;
         // 已过则视为明年。
-        let candidate = if candidate < today { mk(y + 1) } else { candidate };
-        return (Some(candidate), Some(lit));
+        let candidate = if candidate < today {
+            NaiveDate::from_ymd_opt(y + 1, d.0, d.1).ok_or(())?
+        } else {
+            candidate
+        };
+        return Ok((Some(candidate), Some(lit)));
     }
 
     // X号 / X日（本月）。
     if let Some((day, lit)) = find_number_suffix(text, &["号", "日"]) {
-        let day = day.clamp(1, 28) as u32;
+        if !(1..=31).contains(&day) {
+            return Err(());
+        }
         let y = today.year();
         let m = today.month();
-        let mut d = NaiveDate::from_ymd_opt(y, m, day).unwrap_or(today);
+        let mut d = NaiveDate::from_ymd_opt(y, m, day as u32).ok_or(())?;
         if d < today {
-            // 下个月
+            // 下个月；该月无此日则视为非法。
             let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
-            d = NaiveDate::from_ymd_opt(ny, nm, day).unwrap_or(d);
+            d = NaiveDate::from_ymd_opt(ny, nm, day as u32).ok_or(())?;
         }
-        return (Some(d), Some(lit));
+        return Ok((Some(d), Some(lit)));
     }
 
     // 下个月 / 下月。
@@ -176,11 +209,14 @@ fn extract_date(text: &str, today: NaiveDate) -> (Option<NaiveDate>, Option<&str
                 (today.year(), today.month() + 1)
             };
             let day = today.day().min(28);
-            return (Some(NaiveDate::from_ymd_opt(y, m, day).unwrap_or(today)), Some(pat));
+            return Ok((
+                Some(NaiveDate::from_ymd_opt(y, m, day).ok_or(())?),
+                Some(pat),
+            ));
         }
     }
 
-    (None, None)
+    Ok((None, None))
 }
 
 /// 在给定前缀列表中查找「星期几」，返回 (1..7, 匹配字面量)。
@@ -248,7 +284,8 @@ fn extract_month_day(text: &str) -> Option<((u32, u32), &str)> {
                     if let Some(j) = after.find(suffix) {
                         if let Some((d, _)) = leading_number(&after[..j]) {
                             if (1..=12).contains(&m) && (1..=31).contains(&d) {
-                                let lit = &text[before.len() - _digit_len(before)..i + 3 + j + suffix.len()];
+                                let lit = &text
+                                    [before.len() - _digit_len(before)..i + 3 + j + suffix.len()];
                                 return Some(((m as u32, d as u32), lit));
                             }
                         }
@@ -266,55 +303,69 @@ fn extract_month_day(text: &str) -> Option<((u32, u32), &str)> {
 
 /// 返回 (墙钟时间, 匹配字面量)。
 fn extract_time(text: &str) -> (Option<NaiveTime>, Option<&str>) {
-    // 时段修饰：上午/凌晨/早上/早晨 → AM；下午/晚上/傍晚 → PM；中午/正午 → 12:00。
-    let (period, period_lit): (i64, Option<&str>) = if let Some(p) = first_of(text, &["凌晨", "早上", "早晨", "上午"]) {
-        (0, Some(p))
-    } else if let Some(p) = first_of(text, &["下午", "傍晚", "晚上"]) {
-        (12, Some(p))
-    } else if let Some(p) = first_of(text, &["中午", "正午"]) {
-        (12, Some(p))
-    } else {
-        (0, None)
-    };
+    // 时段修饰：凌晨/早上/早晨/上午 → AM；下午/傍晚 → PM；晚上 → PM 且 12 点视为 0 点；
+    // 中午/正午 → 12:00。
+    let (period, period_lit, midnight_12): (i64, Option<&str>, bool) =
+        if let Some(p) = first_of(text, &["凌晨"]) {
+            (0, Some(p), true)
+        } else if let Some(p) = first_of(text, &["早上", "早晨", "上午"]) {
+            (0, Some(p), false)
+        } else if let Some(p) = first_of(text, &["下午", "傍晚"]) {
+            (12, Some(p), false)
+        } else if let Some(p) = first_of(text, &["晚上"]) {
+            (12, Some(p), true)
+        } else if let Some(p) = first_of(text, &["中午", "正午"]) {
+            (12, Some(p), false)
+        } else {
+            (0, None, false)
+        };
 
     // 中午/正午 → 12:00（不依赖具体点数）。
-    if period_lit.is_some() && period == 12 && (text.contains("中午") || text.contains("正午")) && !text.contains("点") {
+    if period_lit.is_some()
+        && period == 12
+        && !midnight_12
+        && (text.contains("中午") || text.contains("正午"))
+        && !text.contains("点")
+    {
         return (NaiveTime::from_hms_opt(12, 0, 0), period_lit);
     }
 
     // HH:MM 或 H:MM。
     if let (Some(h), Some(m), lit) = extract_clock(text) {
-        return (build_time(h, m, period), lit);
+        return (build_time(h, m, period, midnight_12), lit);
     }
 
-    // X点Y分 / X点Y。
-    if let (Some(h), Some(m), lit) = extract_hour_minute(text) {
-        let t = build_time(h, m, period);
-        return (t, lit);
-    }
-
-    // X点半。
+    // BUG-06：X点半 / 点30 必须在「X点Y分/X点」之前判断，否则会被 extract_hour_minute 吞掉半小时。
     if let Some((h, lit)) = find_number_suffix(text, &["点半", "点30"]) {
-        let t = build_time(h, 30, period);
+        let t = build_time(h, 30, period, midnight_12);
         return (t, Some(lit));
     }
 
-    // X点 / X时 / X点钟。
-    if let Some((h, lit)) = find_number_suffix(text, &["点钟", "点", "时"]) {
-        let t = build_time(h, 0, period);
+    // X点Y分 / X点Y / X点。
+    if let (Some(h), Some(m), lit) = extract_hour_minute(text) {
+        let t = build_time(h, m, period, midnight_12);
+        return (t, lit);
+    }
+
+    // X时 / X点钟（extract_hour_minute 未覆盖的「时/点钟」表达）。
+    if let Some((h, lit)) = find_number_suffix(text, &["点钟", "时"]) {
+        let t = build_time(h, 0, period, midnight_12);
         return (t, Some(lit));
     }
 
     (None, None)
 }
 
-fn build_time(hour: i64, minute: i64, period: i64) -> Option<NaiveTime> {
+/// `period=12` 为下午/晚上时段；`midnight_12=true` 时 12 点按 0 点处理（晚上/凌晨 12 点）。
+fn build_time(hour: i64, minute: i64, period: i64, midnight_12: bool) -> Option<NaiveTime> {
     let mut h = hour;
-    if period == 12 {
-        // 下午/晚上：<12 的钟点 +12。
+    if period == 12 && !(midnight_12 && h == 12) {
+        // 下午/晚上：<12 的钟点 +12；12 点保持 12（除非是晚上/凌晨 12 点）。
         if h < 12 {
             h += 12;
         }
+    } else if midnight_12 && h == 12 {
+        h = 0;
     }
     if !(0..24).contains(&h) || !(0..60).contains(&minute) {
         return None;
@@ -328,9 +379,13 @@ fn extract_clock(text: &str) -> (Option<i64>, Option<i64>, Option<&str>) {
     for (i, &b) in bytes.iter().enumerate() {
         if b == b':' {
             let before = &text[..i];
-            let Some((h, _)) = trailing_number(before) else { continue };
+            let Some((h, _)) = trailing_number(before) else {
+                continue;
+            };
             let after = &text[i + 1..];
-            let Some((m, _)) = leading_number(after) else { continue };
+            let Some((m, _)) = leading_number(after) else {
+                continue;
+            };
             if (0..24).contains(&h) && (0..60).contains(&m) {
                 let start = i - _digit_len(before);
                 let end = i + 1 + _digit_len(after);
@@ -346,7 +401,9 @@ fn extract_clock(text: &str) -> (Option<i64>, Option<i64>, Option<&str>) {
 fn extract_hour_minute(text: &str) -> (Option<i64>, Option<i64>, Option<&str>) {
     if let Some(pos) = text.find("点") {
         let before = &text[..pos];
-        let Some((h, _)) = trailing_number(before) else { return (None, None, None) };
+        let Some((h, _)) = trailing_number(before) else {
+            return (None, None, None);
+        };
         let after = &text[pos + "点".len()..];
         // X点Y分。
         if let Some(j) = after.find("分") {
@@ -478,7 +535,10 @@ fn leading_number(s: &str) -> Option<(i64, usize)> {
 
 /// 数字字符长度（字节）。
 fn _digit_len(s: &str) -> usize {
-    trailing_number(s).map(|(_, l)| l).or_else(|| leading_number(s).map(|(_, l)| l)).unwrap_or(0)
+    trailing_number(s)
+        .map(|(_, l)| l)
+        .or_else(|| leading_number(s).map(|(_, l)| l))
+        .unwrap_or(0)
 }
 
 /// 查找「数字 + 后缀」组合，返回 (数值, 完整字面量)。
@@ -556,5 +616,39 @@ mod tests {
     fn test_no_match() {
         let r = parse_natural_language("随便写点东西", "Asia/Shanghai", &now());
         assert!(!r.matched);
+    }
+
+    #[test]
+    fn test_half_hour_is_kept() {
+        let r = parse_natural_language("明天3点半开会", "Asia/Shanghai", &now());
+        assert_eq!(r.time.as_deref(), Some("03:30"));
+        let r2 = parse_natural_language("明天下午3点半开会", "Asia/Shanghai", &now());
+        assert_eq!(r2.time.as_deref(), Some("15:30"));
+    }
+
+    #[test]
+    fn test_midnight_twelve_hour_semantics() {
+        let r = parse_natural_language("晚上12点开会", "Asia/Shanghai", &now());
+        assert_eq!(r.time.as_deref(), Some("00:00"));
+        let r2 = parse_natural_language("凌晨12点开会", "Asia/Shanghai", &now());
+        assert_eq!(r2.time.as_deref(), Some("00:00"));
+        let r3 = parse_natural_language("下午12点半开会", "Asia/Shanghai", &now());
+        assert_eq!(r3.time.as_deref(), Some("12:30"));
+    }
+
+    #[test]
+    fn test_huge_relative_days_falls_back() {
+        let r = parse_natural_language("9999999999天后开会", "Asia/Shanghai", &now());
+        assert!(!r.matched);
+        let r2 = parse_natural_language("999999999999999天后开会", "Asia/Shanghai", &now());
+        assert!(!r2.matched);
+    }
+
+    #[test]
+    fn test_invalid_calendar_date_falls_back() {
+        let r = parse_natural_language("2月30日交付", "Asia/Shanghai", &now());
+        assert!(!r.matched);
+        let r2 = parse_natural_language("2月31日交付", "Asia/Shanghai", &now());
+        assert!(!r2.matched);
     }
 }

@@ -37,7 +37,11 @@ pub struct Storage {
 
 impl Storage {
     pub fn new(dir: PathBuf) -> Self {
-        Storage { dir, mtimes: HashMap::new(), force_overwrite: false }
+        Storage {
+            dir,
+            mtimes: HashMap::new(),
+            force_overwrite: false,
+        }
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -100,14 +104,15 @@ impl Storage {
 
     /// 版本校验 + 迁移骨架（§5.7）。
     fn migrate_if_needed(&self, file: &str, mut value: Value) -> AppResult<Value> {
-        let version = value
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        if version > CURRENT_VERSION {
-            return Err(AppError::NewerVersion { file: file.to_string(), version });
+        let version = value.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+        // BUG-13：版本号超过 u32 或高于当前版本都拒绝加载，避免 as u32 截断后被误当旧数据迁移。
+        if version > CURRENT_VERSION as u64 {
+            return Err(AppError::NewerVersion {
+                file: file.to_string(),
+                version,
+            });
         }
-        let mut v = version;
+        let mut v = version as u32;
         while v < CURRENT_VERSION {
             value = migrate_step(file, v, value);
             v += 1;
@@ -117,7 +122,8 @@ impl Storage {
 
     fn backup_corrupt(&self, file: &str) -> Option<String> {
         let src = self.path(file);
-        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        // BUG-26：备份名精确到毫秒，避免同一秒内多次损坏加载互相覆盖。
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%3f");
         let dst = self.path(&format!("{file}.corrupt-{ts}.bak"));
         fs::copy(&src, &dst).ok().map(|_| dst.display().to_string())
     }
@@ -147,7 +153,9 @@ impl Storage {
         // V3.1：检测到外部修改且未显式选择「覆盖」时，写入前拦截并返回结构化错误，
         // 避免静默覆盖外部改动（用户可在前端选择 reload / overwrite）。
         if status == MtimeStatus::ExternalChange && !self.force_overwrite {
-            return Err(AppError::ExternalChange { file: file.to_string() });
+            return Err(AppError::ExternalChange {
+                file: file.to_string(),
+            });
         }
 
         // 覆盖前备份上一份有效内容到 .bak（best-effort）。
@@ -162,7 +170,8 @@ impl Storage {
         // 原子重命名（Windows 同卷 rename 为原子操作）。
         fs::rename(&tmp, &path)?;
 
-        self.mtimes.insert(key, fs::metadata(&path).and_then(|m| m.modified()).ok());
+        self.mtimes
+            .insert(key, fs::metadata(&path).and_then(|m| m.modified()).ok());
         // 覆盖完成后复位，后续外部修改再次触发拦截。
         self.force_overwrite = false;
         Ok(status)
@@ -173,7 +182,10 @@ impl Storage {
     // -----------------------------------------------------------------------
 
     pub fn read_events(&mut self) -> AppResult<Vec<Event>> {
-        Ok(self.read_json::<EventsFile>("events.json")?.map(|f| f.events).unwrap_or_default())
+        Ok(self
+            .read_json::<EventsFile>("events.json")?
+            .map(|f| f.events)
+            .unwrap_or_default())
     }
 
     pub fn read_routines(&mut self) -> AppResult<Vec<Routine>> {
@@ -184,7 +196,10 @@ impl Storage {
     }
 
     pub fn read_tasks(&mut self) -> AppResult<Vec<Task>> {
-        Ok(self.read_json::<TasksFile>("tasks.json")?.map(|f| f.tasks).unwrap_or_default())
+        Ok(self
+            .read_json::<TasksFile>("tasks.json")?
+            .map(|f| f.tasks)
+            .unwrap_or_default())
     }
 
     pub fn read_long_tasks(&mut self) -> AppResult<Vec<LongTask>> {
@@ -201,28 +216,40 @@ impl Storage {
     pub fn save_events(&mut self, events: &[Event]) -> AppResult<MtimeStatus> {
         self.write_json_atomic(
             "events.json",
-            &EventsFile { version: CURRENT_VERSION, events: events.to_vec() },
+            &EventsFile {
+                version: CURRENT_VERSION,
+                events: events.to_vec(),
+            },
         )
     }
 
     pub fn save_routines(&mut self, routines: &[Routine]) -> AppResult<MtimeStatus> {
         self.write_json_atomic(
             "routines.json",
-            &RoutinesFile { version: CURRENT_VERSION, routines: routines.to_vec() },
+            &RoutinesFile {
+                version: CURRENT_VERSION,
+                routines: routines.to_vec(),
+            },
         )
     }
 
     pub fn save_tasks(&mut self, tasks: &[Task]) -> AppResult<MtimeStatus> {
         self.write_json_atomic(
             "tasks.json",
-            &TasksFile { version: CURRENT_VERSION, tasks: tasks.to_vec() },
+            &TasksFile {
+                version: CURRENT_VERSION,
+                tasks: tasks.to_vec(),
+            },
         )
     }
 
     pub fn save_long_tasks(&mut self, tasks: &[LongTask]) -> AppResult<MtimeStatus> {
         self.write_json_atomic(
             "long_tasks.json",
-            &LongTasksFile { version: CURRENT_VERSION, long_tasks: tasks.to_vec() },
+            &LongTasksFile {
+                version: CURRENT_VERSION,
+                long_tasks: tasks.to_vec(),
+            },
         )
     }
 
@@ -240,7 +267,10 @@ impl Storage {
     pub fn save_templates(&mut self, templates: &[Template]) -> AppResult<MtimeStatus> {
         self.write_json_atomic(
             "templates.json",
-            &TemplatesFile { version: CURRENT_VERSION, templates: templates.to_vec() },
+            &TemplatesFile {
+                version: CURRENT_VERSION,
+                templates: templates.to_vec(),
+            },
         )
     }
 
@@ -252,7 +282,11 @@ impl Storage {
         let file = format!("archive/{month}.json");
         Ok(self
             .read_json::<ArchiveFile>(&file)?
-            .unwrap_or_else(|| ArchiveFile { version: CURRENT_VERSION, month: month.to_string(), days: Default::default() }))
+            .unwrap_or_else(|| ArchiveFile {
+                version: CURRENT_VERSION,
+                month: month.to_string(),
+                days: Default::default(),
+            }))
     }
 
     pub fn save_archive_month(&mut self, archive: &ArchiveFile) -> AppResult<MtimeStatus> {
@@ -261,7 +295,17 @@ impl Storage {
     }
 
     /// 加载 `[from, to]`（YYYY-MM，含端点）区间的全部归档天，合并为天 → 天内容 映射。
-    pub fn load_archive_range(&mut self, from: &str, to: &str) -> AppResult<std::collections::BTreeMap<String, ArchiveDay>> {
+    pub fn load_archive_range(
+        &mut self,
+        from: &str,
+        to: &str,
+    ) -> AppResult<std::collections::BTreeMap<String, ArchiveDay>> {
+        // BUG-21：先校验月份参数，避免 next_month 对非法输入永不收敛。
+        if !valid_month(from) || !valid_month(to) || from > to {
+            return Err(AppError::InvalidInput(format!(
+                "归档月份区间无效：{from} ~ {to}"
+            )));
+        }
         let mut map = std::collections::BTreeMap::new();
         let mut m = from.to_string();
         while m.as_str() <= to {
@@ -288,7 +332,14 @@ impl Storage {
         let config = self.read_config()?;
         let month = timeutil::current_month_string(&config.timezone);
         let archive = self.load_archive_month(&month)?;
-        Ok(AppData { events, routines, tasks, long_tasks, config, archive })
+        Ok(AppData {
+            events,
+            routines,
+            tasks,
+            long_tasks,
+            config,
+            archive,
+        })
     }
 }
 
@@ -310,7 +361,9 @@ fn migrate_step(file: &str, from: u32, value: Value) -> Value {
 /// 补齐策略与 serde `#[serde(default)]` 一致，但显式写入，保证老 JSON 升级后
 /// 结构完整、可直接被旧/新版本一致读取；未知字段保持不动（前向兼容）。
 fn migrate_v0_to_v1(mut value: Value) -> Value {
-    let Some(obj) = value.as_object_mut() else { return value };
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
     obj.insert("version".to_string(), json!(1));
 
     // 事件。
@@ -366,11 +419,13 @@ fn migrate_v0_to_v1(mut value: Value) -> Value {
         "enabled": true, "sound": false,
         "doNotDisturb": { "enabled": true, "start": "22:00", "end": "08:00" }
     }));
-    obj.entry("appearance").or_insert(json!({ "theme": "light" }));
+    obj.entry("appearance")
+        .or_insert(json!({ "theme": "light" }));
     obj.entry("behavior").or_insert(json!({
         "minimizeToTray": true, "launchAtStartup": false, "globalHotkey": "Ctrl+Shift+A"
     }));
-    obj.entry("candidate").or_insert(json!({ "missedRoutineGraceHours": 4 }));
+    obj.entry("candidate")
+        .or_insert(json!({ "missedRoutineGraceHours": 4 }));
 
     // 归档天内容。
     if let Some(days) = obj.get_mut("days").and_then(|v| v.as_object_mut()) {
@@ -390,7 +445,9 @@ fn migrate_v0_to_v1(mut value: Value) -> Value {
 /// 字段为未知字段，serde 忽略并在下次写配置时自然丢弃。
 /// 事件/日常/浮动/归档/templates 结构不变。
 fn migrate_v1_to_v2(file: &str, mut value: Value) -> Value {
-    let Some(obj) = value.as_object_mut() else { return value };
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
     obj.insert("version".to_string(), json!(2));
 
     // 仅配置类文件需要新增配置段，避免把配置段写入数据文件。
@@ -404,13 +461,13 @@ fn migrate_v1_to_v2(file: &str, mut value: Value) -> Value {
 /// V3.0 提醒分级策略 `priorityPolicy`（默认 high=system, normal=app, low=app）。
 /// 事件/日常/浮动/归档/templates 结构零改动。
 fn migrate_v2_to_v3(file: &str, mut value: Value) -> Value {
-    let Some(obj) = value.as_object_mut() else { return value };
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
     obj.insert("version".to_string(), json!(3));
 
     if file == "config.json" {
-        let notifications = obj
-            .get_mut("notifications")
-            .and_then(|v| v.as_object_mut());
+        let notifications = obj.get_mut("notifications").and_then(|v| v.as_object_mut());
         match notifications {
             Some(notif) => {
                 notif.entry("priorityPolicy").or_insert(json!({
@@ -433,7 +490,9 @@ fn migrate_v2_to_v3(file: &str, mut value: Value) -> Value {
 /// v3 → v4：写入版本号 4；为 `config.json` 补齐 V3.1 标签颜色映射 `tagColors`。
 /// 事件/日常/浮动/归档/templates 结构零改动。
 fn migrate_v3_to_v4(file: &str, mut value: Value) -> Value {
-    let Some(obj) = value.as_object_mut() else { return value };
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
     obj.insert("version".to_string(), json!(4));
 
     if file == "config.json" {
@@ -453,7 +512,9 @@ fn migrate_v4_to_v5(mut value: Value) -> Value {
 /// v5 → v6：写入版本号 6；为 `routines.json` 的每个时间窗口显式补齐
 /// V1.2.1 新增字段 `everyDays: null` / `anchorDate: null`（按星期模式）。
 fn migrate_v5_to_v6(file: &str, mut value: Value) -> Value {
-    let Some(obj) = value.as_object_mut() else { return value };
+    let Some(obj) = value.as_object_mut() else {
+        return value;
+    };
     obj.insert("version".to_string(), json!(6));
 
     if file == "routines.json" {
@@ -473,13 +534,30 @@ fn migrate_v5_to_v6(file: &str, mut value: Value) -> Value {
     value
 }
 
-/// 月份字符串 +1（YYYY-MM）。
+/// 月份字符串 +1（YYYY-MM）。调用方需先校验格式。
 fn next_month(m: &str) -> String {
     let mut parts = m.split('-');
     let year: i32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(2000);
     let month: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-    let (y, mo) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (y, mo) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     format!("{y:04}-{mo:02}")
+}
+
+/// `YYYY-MM` 格式且月份合法。
+fn valid_month(s: &str) -> bool {
+    let mut parts = s.split('-');
+    let Some(y) = parts.next() else { return false };
+    let Some(m) = parts.next() else { return false };
+    parts.next().is_none()
+        && y.len() == 4
+        && y.chars().all(|c| c.is_ascii_digit())
+        && m.len() == 2
+        && m.chars().all(|c| c.is_ascii_digit())
+        && (1..=12).contains(&m.parse::<u32>().unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -542,7 +620,12 @@ pub fn new_task() -> Task {
     }
 }
 
-pub fn new_archive_entry(source: ArchiveSource, source_id: Option<String>, title: &str, time: &str) -> ArchiveEntry {
+pub fn new_archive_entry(
+    source: ArchiveSource,
+    source_id: Option<String>,
+    title: &str,
+    time: &str,
+) -> ArchiveEntry {
     ArchiveEntry {
         id: new_id("a"),
         time: time.to_string(),
@@ -663,7 +746,8 @@ mod tests {
     }
 
     #[test]
-    fn test_long_tasks_missing_file_defaults_empty_and_roundtrips() {        let dir = tmp_dir("long-tasks");
+    fn test_long_tasks_missing_file_defaults_empty_and_roundtrips() {
+        let dir = tmp_dir("long-tasks");
         let mut storage = Storage::new(dir.clone());
         storage.ensure().unwrap();
         // 新目录：long_tasks.json 缺失 → 空列表，不报错（v1.0/v1.1 旧备份兼容）。
@@ -694,6 +778,27 @@ mod tests {
     }
 
     #[test]
+    fn test_version_above_u32_is_rejected() {
+        let dir = tmp_dir("newer-u32");
+        fs::write(
+            dir.join("config.json"),
+            r#"{"version":4294967297,"timezone":"Asia/Shanghai"}"#,
+        )
+        .unwrap();
+        let mut storage = Storage::new(dir);
+        let err = storage.read_config().unwrap_err();
+        assert!(matches!(err, AppError::NewerVersion { version, .. } if version == 4294967297));
+    }
+
+    #[test]
+    fn test_invalid_archive_range_is_rejected() {
+        let dir = tmp_dir("archive-range-invalid");
+        let mut storage = Storage::new(dir);
+        storage.ensure().unwrap();
+        assert!(storage.load_archive_range("2025-13", "2026-01").is_err());
+    }
+
+    #[test]
     fn test_external_change_rejected_then_force_overwrite() {
         let dir = tmp_dir("mtime");
         let mut storage = Storage::new(dir.clone());
@@ -708,7 +813,10 @@ mod tests {
         // 未选择覆盖：写入前拦截，磁盘内容保持外部改动。
         let err = storage.save_events(&[new_ev()]).unwrap_err();
         assert!(matches!(err, AppError::ExternalChange { file } if file == "events.json"));
-        assert_eq!(fs::read_to_string(dir.join("events.json")).unwrap(), external);
+        assert_eq!(
+            fs::read_to_string(dir.join("events.json")).unwrap(),
+            external
+        );
 
         // 选择覆盖：写入成功，并更新 mtime 基线；再次外部修改后重新拦截。
         storage.set_force_overwrite(true);

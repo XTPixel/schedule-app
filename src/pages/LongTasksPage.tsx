@@ -82,7 +82,10 @@ function dateDiffDays(a: string, b: string): number {
   );
 }
 
-function DateCell({ value, onSave }: { value: string; onSave: (v: string) => void }) {  const [v, setV] = useState(value);
+function DateCell({ value, onSave }: { value: string; onSave: (v: string) => void }) {
+  const [v, setV] = useState(value);
+  // BUG-19：保存失败 / 数据刷新后回滚到磁盘真实值。
+  useEffect(() => setV(value), [value]);
   return (
     <input
       type="date"
@@ -91,6 +94,8 @@ function DateCell({ value, onSave }: { value: string; onSave: (v: string) => voi
       onChange={(e) => setV(e.target.value)}
       onBlur={() => {
         if (v && v !== value) onSave(v);
+        // 无论成功与否先回显当前真实值；成功时父组件刷新后值一致，失败时也能纠正显示。
+        setV(value);
       }}
     />
   );

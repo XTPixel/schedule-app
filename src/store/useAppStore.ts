@@ -12,6 +12,7 @@ import {
 import type {
   AppData,
   ArchiveDay,
+  ArchiveEntry,
   CalendarData,
   CandidateSource,
   CandidatesResult,
@@ -44,6 +45,12 @@ export type Page =
   | "extensions";
 export type DrawerKind = "event" | "routine" | "task" | "longtask";
 export type DraftEntity = Event | Routine | Task | LongTask;
+
+/** V1.2.2：删除归档条目的结果（区分成功 / 外部冲突取消）。 */
+export interface RemoveArchiveEntryResult {
+  status: "success" | "cancelled";
+  sessionIds: string[];
+}
 
 export interface Toast {
   id: string;
@@ -198,6 +205,13 @@ function nextId(): string {
   return `t${Date.now()}_${toastSeq}`;
 }
 
+// BUG-20：外部修改冲突可能并发触发；确认框改为排队，逐一出栈，不吞掉先发起的操作。
+let confirmQueue: ConfirmState[] = [];
+function presentNextConfirm() {
+  const next = confirmQueue.shift();
+  useAppStore.setState({ confirm: next ?? null });
+}
+
 interface AppStore {
   data: AppData | null;
   candidates: CandidatesResult | null;
@@ -225,6 +239,8 @@ interface AppStore {
   calendar: CalendarData | null;
   searchResults: SearchResult | null;
   stats: StatsResult | null;
+  /** V1.2.2：最近一次统计范围（归档变化后按此范围自动刷新统计）。 */
+  statsDays: number;
   review: ReviewResult | null;
   tags: TagInfo[];
   /** 标签列表是否已完成首次加载（供过滤条清理失效的持久化标签筛选）。 */
@@ -306,7 +322,8 @@ interface AppStore {
 
   addManualArchive: (title: string, time: string, note: string, date: string) => Promise<void>;
   updateArchiveDay: (date: string, day: ArchiveDay) => Promise<void>;
-  removeArchiveEntry: (date: string, entryId: string) => Promise<void>;
+  /** V1.2.2：删除归档条目；返回成功/取消与 longtask 会话 ids（供撤回）。 */
+  removeArchiveEntry: (date: string, entry: ArchiveEntry) => Promise<RemoveArchiveEntryResult>;
 
   saveConfig: (c: Config) => Promise<void>;
 
@@ -315,6 +332,8 @@ interface AppStore {
   doSearch: (q: SearchQuery) => Promise<void>;
   clearSearch: () => void;
   loadStats: (days: number) => Promise<void>;
+  /** V1.2.2：若统计页已加载，归档 / 会话变化后按最近范围重新拉取统计。 */
+  refreshStatsIfLoaded: () => Promise<void>;
   loadReview: (from: string, to: string) => Promise<void>;
   loadTags: () => Promise<void>;
   renameTag: (oldName: string, newName: string) => Promise<void>;
@@ -366,6 +385,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   calendar: null,
   searchResults: null,
   stats: null,
+  statsDays: 30,
   review: null,
   tags: [],
   tagsLoaded: false,
@@ -562,11 +582,24 @@ export const useAppStore = create<AppStore>((set, get) => ({
     if (!drawer || drawer.kind !== "longtask") return;
     const fresh = get().data?.longTasks.find((x) => x.id === taskId);
     if (!fresh) return;
+    const freshClone = structuredClone(fresh) as LongTask;
+    // BUG-18：保留用户未保存的本地编辑，仅用最新数据刷新会话与已保存字段。
+    const draft = drawer.draft as LongTask;
+    const initial = drawer.initial as LongTask;
+    const localDirty: Partial<LongTask> = {};
+    for (const key of Object.keys(draft) as (keyof LongTask)[]) {
+      if (key === "sessions") continue;
+      if (JSON.stringify(draft[key]) !== JSON.stringify(initial[key])) {
+        (localDirty as Record<string, unknown>)[key] = structuredClone(draft[key]);
+      }
+    }
+    const mergedDraft = { ...freshClone, ...localDirty, sessions: freshClone.sessions };
+    const mergedInitial = { ...freshClone, ...localDirty, sessions: freshClone.sessions };
     set({
       drawer: {
         ...drawer,
-        draft: structuredClone(fresh),
-        initial: { ...structuredClone(fresh), sessions: structuredClone(fresh.sessions) },
+        draft: mergedDraft,
+        initial: mergedInitial,
       },
     });
   },
@@ -582,10 +615,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   askConfirm(title, message, onConfirm, onCancel, confirmLabel, cancelLabel) {
-    set({ confirm: { title, message, onConfirm, onCancel, confirmLabel, cancelLabel } });
+    const req: ConfirmState = { title, message, onConfirm, onCancel, confirmLabel, cancelLabel };
+    if (get().confirm) {
+      confirmQueue.push(req);
+      return;
+    }
+    set({ confirm: req });
   },
   closeConfirm() {
     set({ confirm: null });
+    presentNextConfirm();
   },
 
   // ---- V3.0 F1：计时器 ----
@@ -699,9 +738,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
       // 成功落库后才清除计时（失败保留计时可重试）。
       get().dropTimer(task.id);
       await get().refresh();
+      await get().refreshStatsIfLoaded();
       get().pushToast(`已记录本次投入「${task.title || "长期任务"}」`, "撤回", async () => {
         await withExternalConflict(() => api.deleteLongTaskSession(task.id, session.id));
         await get().refresh();
+        await get().refreshStatsIfLoaded();
         get().syncLongTaskDrawer(task.id);
       });
       return session;
@@ -870,9 +911,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   async deleteLongTask(id) {
+    const original = get().data?.longTasks.find((x) => x.id === id);
+    const hadTimer = Boolean(get().timers[id]);
+    const prevData = get().data;
+    // V1.2.2：先做本地乐观移除，列表 / 现在页立即消失；失败时回滚。
+    if (prevData) {
+      set({
+        data: {
+          ...prevData,
+          longTasks: prevData.longTasks.filter((x) => x.id !== id),
+        },
+      });
+    }
     try {
-      const original = get().data?.longTasks.find((x) => x.id === id);
-      const hadTimer = Boolean(get().timers[id]);
       // V1.2.1 F3：先删后端，成功后才丢弃计时——删除失败时保留进行中的计时。
       const r = await withExternalConflict(() => api.deleteLongTask(id));
       if (r === null) return;
@@ -895,6 +946,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
         });
       }
     } catch (e) {
+      // 失败回滚本地移除（若此时已有刷新后的数据则不再覆盖）。
+      const cur = get().data;
+      if (prevData && cur?.longTasks.every((x) => x.id !== id)) {
+        set({ data: { ...cur, longTasks: [...cur.longTasks, original].filter((x): x is LongTask => x != null) } });
+      }
       setError(`删除长期任务失败：${String(e)}`);
     }
   },
@@ -917,6 +973,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const saved = await withExternalConflict(() => api.updateLongTaskSessionNote(taskId, sessionId, note));
       if (saved === null) return;
       await get().refresh();
+      await get().refreshStatsIfLoaded();
       get().syncLongTaskDrawer(taskId);
     } catch (e) {
       setError(`保存收获失败：${String(e)}`);
@@ -930,6 +987,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const r = await withExternalConflict(() => api.deleteLongTaskSession(taskId, sessionId));
       if (r === null) return;
       await get().refresh();
+      await get().refreshStatsIfLoaded();
       get().syncLongTaskDrawer(taskId);
       if (session) {
         get().pushToast("已删除本次投入记录", "撤回", async () => {
@@ -946,6 +1004,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const r = await withExternalConflict(() => api.undeleteLongTaskSession(taskId, sessionId));
       if (r === null) return;
       await get().refresh();
+      await get().refreshStatsIfLoaded();
       get().syncLongTaskDrawer(taskId);
     } catch (e) {
       setError(`撤回投入记录失败：${String(e)}`);
@@ -984,10 +1043,11 @@ export const useAppStore = create<AppStore>((set, get) => ({
         saveJSON(TIMER_KEY, timers);
       }
       await get().refresh();
+      await get().refreshStatsIfLoaded();
       get().pushToast(`已归档「${title}」`, "撤回", async () => {
         const d = useAppStore.getState().data;
         const dayKey = d ? fmtDate(savedEntry.doneAt, d.config.timezone) : fmtDate(savedEntry.doneAt, tz);
-        await get().removeArchiveEntry(dayKey, savedEntry.id);
+        await get().removeArchiveEntry(dayKey, savedEntry);
         // 非重复来源：还原来源状态；重复实例无需还原序列。
         if (!seriesId) {
           if (sourceType === "event") {
@@ -999,6 +1059,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
           }
         }
         await get().refresh();
+        await get().refreshStatsIfLoaded();
       });
     } catch (e) {
       setError(`归档失败：${String(e)}`);
@@ -1025,6 +1086,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     );
     if (saved === null) return;
     await get().refresh();
+    await get().refreshStatsIfLoaded();
     get().pushToast("已添加记录");
   },
 
@@ -1032,17 +1094,38 @@ export const useAppStore = create<AppStore>((set, get) => ({
     const saved = await withExternalConflict(() => api.updateArchiveDay(date, day));
     if (saved === null) return;
     await get().refresh();
+    // V1.2.2：归档变化后统计同步更新。
+    await get().refreshStatsIfLoaded();
   },
 
-  async removeArchiveEntry(date, entryId) {
-    const data = get().data;
-    if (!data) return;
-    const day = data.archive.days[date];
-    if (!day) return;
-    const next = { ...day, entries: day.entries.filter((x) => x.id !== entryId) };
+  async removeArchiveEntry(date, entry) {
+    // V1.2.2：长期任务聚合条目删除时，同步软删除当天会话，统计与归档一致。
+    if (entry.source === "longtask") {
+      const taskId = entry.sourceId;
+      if (!taskId) {
+        return { status: "cancelled", sessionIds: [] };
+      }
+      const r = await withExternalConflict(() => api.deleteLongTaskArchiveDay(taskId, date));
+      if (r === null) return { status: "cancelled", sessionIds: [] };
+      await get().refresh();
+      await get().refreshStatsIfLoaded();
+      return { status: "success", sessionIds: r.deletedSessionIds };
+    }
+
+    // 普通条目：按目标月份独立加载，修复非当前月删除静默失败（BUG-05）。
+    const month = date.slice(0, 7);
+    const af = await api.getArchiveMonth(month);
+    const day = af.days[date];
+    if (!day) {
+      throw new Error(`归档日期 ${date} 没有记录`);
+    }
+    const next = { ...day, entries: day.entries.filter((x) => x.id !== entry.id) };
     const saved = await withExternalConflict(() => api.updateArchiveDay(date, next));
-    if (saved === null) return;
+    if (saved === null) return { status: "cancelled", sessionIds: [] };
     await get().refresh();
+    // V1.2.2：删除后统计同步变动。
+    await get().refreshStatsIfLoaded();
+    return { status: "success", sessionIds: [] };
   },
 
   async saveConfig(c) {
@@ -1081,10 +1164,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
   async loadStats(days) {
     try {
       const stats = await api.getStats(days);
-      set({ stats });
+      set({ stats, statsDays: days });
     } catch (e) {
       setError(`加载统计失败：${String(e)}`);
     }
+  },
+
+  async refreshStatsIfLoaded() {
+    if (!get().stats) return;
+    await get().loadStats(get().statsDays);
   },
 
   async loadReview(from, to) {

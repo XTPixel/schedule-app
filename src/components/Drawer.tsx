@@ -579,7 +579,14 @@ function TaskFields({
           type="date"
           className={inputCls}
           value={deadlineDate}
-          onChange={(e) => updateDraft({ deadline: buildLocalIso(e.target.value, "23:59", tz) } as never)}
+          onChange={(e) => {
+            // BUG-14：清空输入框直接置 null，不再对空串构造 ISO。
+            if (!e.target.value) {
+              updateDraft({ deadline: null } as never);
+            } else {
+              updateDraft({ deadline: buildLocalIso(e.target.value, "23:59", tz) } as never);
+            }
+          }}
         />
         {draft.deadline && (
           <button

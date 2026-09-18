@@ -7,15 +7,24 @@ pub enum AppError {
     Json(String),
     Parse(String),
     /// 数据文件版本高于当前程序支持版本（§5.7：拒绝加载 + 提示导出/升级）。
-    NewerVersion { file: String, version: u32 },
+    NewerVersion {
+        file: String,
+        version: u64,
+    },
     /// 数据文件损坏，已备份到 .bak。
-    Corrupted { file: String, backup: String, detail: String },
+    Corrupted {
+        file: String,
+        backup: String,
+        detail: String,
+    },
     NotFound(String),
     InvalidTimezone(String),
     InvalidInput(String),
     /// 数据文件在应用读取之后被外部修改（V3.1：写入前拦截，避免静默覆盖）。
     /// Display 输出 `EXTERNAL_CHANGE:<file>`，前端按该结构化前缀识别。
-    ExternalChange { file: String },
+    ExternalChange {
+        file: String,
+    },
 }
 
 impl fmt::Display for AppError {
@@ -28,8 +37,15 @@ impl fmt::Display for AppError {
                 f,
                 "数据文件 {file} 的版本({version})高于当前程序支持版本，请安装更新版本后读取此数据"
             ),
-            AppError::Corrupted { file, backup, detail } => {
-                write!(f, "数据文件 {file} 损坏（{detail}），原始文件已备份到 {backup}")
+            AppError::Corrupted {
+                file,
+                backup,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "数据文件 {file} 损坏（{detail}），原始文件已备份到 {backup}"
+                )
             }
             AppError::NotFound(m) => write!(f, "未找到: {m}"),
             AppError::InvalidTimezone(m) => write!(f, "无效时区: {m}"),

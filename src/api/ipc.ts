@@ -77,6 +77,20 @@ export const deleteLongTaskSession = (taskId: string, sessionId: string) =>
 export const undeleteLongTaskSession = (taskId: string, sessionId: string) =>
   invoke<void>("undelete_long_task_session", { input: { taskId, sessionId } });
 
+export interface DeleteLongTaskArchiveDayResult {
+  deletedSessionIds: string[];
+}
+
+export const deleteLongTaskArchiveDay = (taskId: string, date: string) =>
+  invoke<DeleteLongTaskArchiveDayResult>("delete_long_task_archive_day", {
+    input: { taskId, date },
+  });
+
+export const undeleteLongTaskArchiveDay = (taskId: string, date: string, sessionIds: string[]) =>
+  invoke<void>("undelete_long_task_archive_day", {
+    input: { taskId, date, sessionIds },
+  });
+
 export const archiveEntry = (entry: ArchiveEntry) =>
   invoke<ArchiveEntry>("archive_entry", { entry });
 
