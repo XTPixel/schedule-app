@@ -1,0 +1,48 @@
+// Real exit UI with a closed loopback endpoint; no production credentials.
+const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),crypto=require('node:crypto');const{spawn,execFileSync}=require('node:child_process');const{Client}=require('./webview-qa-client.cjs');
+const root=path.resolve(__dirname,'..'),version=require('../package.json').version,android=process.env.MOMENT_HANDOFF_ANDROID==='1',serial='emulator-5558',pkg='com.personal.schedule',port=android?9227:9225;
+const out=path.join(root,'.build-cache/handoff-evidence'),base=path.join(out,'windows-'+Date.now()),dir=path.join(base,'data'),adb=path.join(process.env.ANDROID_HOME,'platform-tools/adb.exe'),exe=path.join(base,'schedule-app.exe');
+const shell=(...a)=>execFileSync(adb,['-s',serial,...a],{encoding:'utf8',timeout:30000}),wait=ms=>new Promise(r=>setTimeout(r,ms));const results=[];let client,child,task,long,originalTimers,pausedMs,binarySha256;
+fs.mkdirSync(out,{recursive:true});
+async function until(fn){for(let n=0;n<100;n++){try{if(await fn())return}catch(e){if(!/closed|Execution context was destroyed|undefined/.test(String(e)))throw e}await wait(100)}throw Error('Handoff UI did not become ready')}
+async function start(){
+ if(android){shell('shell','am','start','-n',pkg+'/.MomentLauncherActivity');await until(async()=>{try{const pid=shell('shell','pidof',pkg).trim();shell('forward','tcp:'+port,'localabstract:webview_devtools_remote_'+pid);client=await Client.connect(port);return true}catch{return false}})}
+ else{child=spawn(exe,[],{windowsHide:true,stdio:'ignore',env:{...process.env,MOMENT_QA_DATA_DIR:dir,APPDATA:path.join(base,'roaming'),LOCALAPPDATA:path.join(base,'local'),WEBVIEW2_USER_DATA_FOLDER:path.join(base,'webview'),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port='+port}});let lastError;try{await until(async()=>{try{client=await Client.connect(port);await client.assertWindowsIsolation();return true}catch(e){lastError=String(e);if(client)client.close();return false}})}catch{throw Error('Native QA startup failed: '+lastError+'; process exit='+child.exitCode)}}
+ assert.equal(await client.invoke('plugin:app|version'),version);await until(()=>client.evaluate('Boolean(document.querySelector("nav button"))'));
+}
+async function settings(){await client.evaluate('[...document.querySelectorAll("nav button")].find(x=>x.innerText.includes("设置")).click()');await until(()=>client.evaluate('[...document.querySelectorAll("button")].some(x=>x.innerText.trim()==="同步并退出")'))}
+const click=text=>client.evaluate('[...document.querySelectorAll("button")].find(x=>x.innerText.trim()==='+JSON.stringify(text)+').click()');
+const timer=()=>client.evaluate('JSON.parse(localStorage.getItem("schedule.timers.v1")||"{}")['+JSON.stringify(long.id)+']');
+async function restoreTimers(){
+ const timers=JSON.parse(originalTimers||'{}');for(const value of Object.values(timers)){value.running=false;value.startedAt=0}
+ const draft={updatedAt:Date.now()+1,timers};await client.invoke('save_local_timer_exit',{draft});await client.evaluate('localStorage.setItem("schedule.timers.v1",'+JSON.stringify(JSON.stringify(timers))+');localStorage.setItem("schedule.timers.checkpoint.v2",'+JSON.stringify(JSON.stringify(draft))+');location.reload();true');await until(()=>client.evaluate('Boolean(document.querySelector("nav button"))'));
+}
+async function exited(){await until(async()=>{if(!android)return child.exitCode!==null;const resumed=shell('shell','dumpsys','activity','activities').split('\n').filter(x=>/mResumedActivity|topResumedActivity/.test(x));return resumed.length>0&&!resumed.some(x=>x.includes(pkg+'/'))});client.close();client=null}
+async function check(name,fn){try{await fn();results.push({name,passed:true});console.log('PASS '+name)}catch(e){results.push({name,passed:false,error:String(e)});throw e}}
+async function disconnect(){for(let n=0;n<100;n++){try{return await client.invoke('sync_disconnect')}catch(e){if(!String(e).includes('同步正在进行'))throw e;await wait(100)}}throw Error('Dummy profile remained busy')}
+async function main(){
+ if(android){assert.equal(shell('emu','avd','name').trim().split(/\s+/)[0],'Moment_API36')}
+ else{try{await fetch('http://127.0.0.1:'+port+'/json/list');throw Error('QA port occupied')}catch(e){if(/occupied/.test(String(e)))throw e}fs.mkdirSync(dir,{recursive:true});fs.writeFileSync(path.join(dir,'.moment-qa-root'),'moment-isolated-test-data-v1');fs.copyFileSync(path.join(process.env.CARGO_TARGET_DIR,'debug/schedule-app.exe'),exe);binarySha256=crypto.createHash('sha256').update(fs.readFileSync(exe)).digest('hex')}
+ await start();const status=await client.invoke('sync_get_status');if(android&&status.configured&&status.deviceName==='QA closed loopback')await client.invoke('sync_disconnect');assert.equal((await client.invoke('sync_get_status')).configured,false);originalTimers=await client.evaluate('localStorage.getItem("schedule.timers.v1")');const now=new Date().toISOString(),day=new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai'}).format(new Date()),common={id:'',title:'QA handoff '+Date.now(),description:null,tags:['qa-handoff'],priority:'normal',createdAt:now,updatedAt:now,deletedAt:null};
+ task=await client.invoke('save_task',{task:{...common,deadline:null,sortOrder:0,status:'active',completedAt:null}});long=await client.invoke('save_long_task',{task:{...common,title:common.title+' timer',startDate:day,dueDate:day,status:'active',endedAt:null,sessions:[]}});
+ await client.evaluate('location.reload();true');await until(()=>client.evaluate('[...document.querySelectorAll("main h3")].some(x=>x.innerText==='+JSON.stringify(long.title)+')'));
+ await client.evaluate('(()=>{const h=[...document.querySelectorAll("main h3")].find(x=>x.innerText==='+JSON.stringify(long.title)+');[...h.closest("button").parentElement.querySelectorAll("button")].find(x=>x.innerText.trim()==="开始").click()})()');await until(async()=>Boolean((await timer())?.running));await wait(1200);await settings();
+ await check('local-only visible exit pauses the running timer and preserves its draft on restart',async()=>{
+  try{await click('同步并退出')}catch(e){if(!/closed/.test(String(e)))throw e}await exited();await start();await until(async()=>{const value=await timer();return value&&!value.running&&value.accumulatedMs>=1000});const paused=await timer();pausedMs=paused.accumulatedMs;assert.equal((await client.invoke('load_all_data')).tasks.find(x=>x.id===task.id).title,task.title);
+ });
+ await client.invoke('sync_configure',{input:{bucket:'qa-invalid-bucket',downloadDomain:'https://127.0.0.1:1',prefix:'qa-handoff/'+Date.now(),deviceName:'QA closed loopback',accessKey:'qa-not-a-real-access-key',secretKey:'qa-not-a-real-secret-key',passphrase:'qa-not-a-real-passphrase'}});await settings();
+ await check('real native network failure opens one visible confirmation after repeated clicks',async()=>{
+  await client.evaluate('[...document.querySelectorAll("button")].find(x=>x.innerText.trim()==="同步并退出").click();[...document.querySelectorAll("button")].find(x=>x.innerText.trim()==="同步并退出").click();true');await until(()=>client.evaluate('document.body.innerText.includes("同步尚未完成")'));assert.equal(await client.evaluate('[...document.querySelectorAll("h3")].filter(x=>x.innerText==="同步尚未完成").length'),1);
+ });
+ await check('returning from failed handoff keeps the saved item and permits a second attempt',async()=>{
+  await click('返回应用');await until(()=>client.evaluate('!document.body.innerText.includes("同步尚未完成")'));assert.equal((await client.invoke('load_all_data')).tasks.find(x=>x.id===task.id).title,task.title);await click('同步并退出');await until(()=>client.evaluate('document.body.innerText.includes("同步尚未完成")'));
+ });
+ await check('explicit keep-local exit closes the native application and reopening restores a paused draft',async()=>{
+  try{await click('保留本地并退出')}catch(e){if(!/closed/.test(String(e)))throw e}await exited();await start();const restored=await timer();assert.equal(restored.running,false);assert.ok(restored.accumulatedMs<=pausedMs);assert.ok(restored.accumulatedMs>=Math.max(0,pausedMs-10000));assert.equal((await client.invoke('load_all_data')).tasks.find(x=>x.id===task.id).title,task.title);
+ });
+ await check('disconnecting the dummy profile and removing owned fixtures succeeds',async()=>{
+  await disconnect();assert.equal((await client.invoke('sync_get_status')).configured,false);
+  await client.invoke('delete_task',{id:task.id});await client.invoke('delete_long_task',{id:long.id});task=null;long=null;await restoreTimers();originalTimers=undefined;await settings();try{await click('同步并退出')}catch(e){if(!/closed/.test(String(e)))throw e}await exited();
+ });
+}
+main().catch(e=>{console.error(String(e));process.exitCode=1}).finally(async()=>{try{if(client){if((await client.invoke('sync_get_status')).configured)await client.invoke('sync_disconnect');if(task)await client.invoke('delete_task',{id:task.id});if(long)await client.invoke('delete_long_task',{id:long.id});if(originalTimers!==undefined)await client.evaluate(originalTimers===null?'localStorage.removeItem("schedule.timers.v1");true':'localStorage.setItem("schedule.timers.v1",'+JSON.stringify(originalTimers)+');true')}}catch{}if(client)client.close();if(child&&child.exitCode===null)child.kill();fs.writeFileSync(path.join(out,android?'android.json':'windows.json'),JSON.stringify({recordedAt:new Date().toISOString(),version,platform:android?'API36 emulator':'marked Windows QA process',binarySha256,failureEndpoint:'https://127.0.0.1:1 with synthetic credentials; all native commands are real',results},null,2))});

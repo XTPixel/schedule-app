@@ -32,6 +32,8 @@ try {
         [Management.Automation.Language.Parser]::ParseFile($momentScript.FullName,[ref]$momentParseTokens,[ref]$momentParseErrors) | Out-Null
         if($momentParseErrors.Count){throw "Invalid PowerShell script: $($momentScript.Name)"}
     }
+    & node (Join-Path $PSScriptRoot 'source-audit.cjs')
+    if ($LASTEXITCODE -ne 0) { throw 'Source audit failed' }
     @{
         recordedAt=[DateTime]::UtcNow.ToString('o')
         version=(Get-Content (Join-Path $momentProjectRoot 'package.json') -Raw | ConvertFrom-Json).version

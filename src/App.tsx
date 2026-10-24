@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { syncExit, syncForceExit, syncGetStatus, syncNow, syncTick, syncCancel, recoveryStatus } from "./api/ipc";
+import { syncGetStatus, syncNow, syncTick, syncCancel, recoveryStatus } from "./api/ipc";
 import { useAppStore } from "./store/useAppStore";
 import { applyTheme } from "./lib/theme";
 import { Sidebar } from "./components/Sidebar";
@@ -21,6 +21,7 @@ import { ExtensionsPage } from "./pages/ExtensionsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { isAndroid } from "./lib/platform";
 import { setEditingAllowed } from "./lib/editing";
+import { requestAppExit } from "./lib/appExit";
 import type { SyncStatus } from "./types";
 
 export default function App() {
@@ -85,14 +86,7 @@ export default function App() {
     }));
     unlisteners.push(listen("tray-quick-add", () => triggerQuickAdd()));
     unlisteners.push(listen("app-resumed", () => void refresh()));
-    unlisteners.push(listen("sync-exit-request", () => {
-      void syncExit().catch((error) => {
-        const message = String(error);
-        if (window.confirm(`同步未完成：${message}\n\n确定要保留本地未上传数据并退出吗？`)) {
-          void syncForceExit();
-        }
-      });
-    }));
+    unlisteners.push(listen("sync-exit-request", () => { void requestAppExit(); }));
     const resumeSync = async () => {
       if (document.visibilityState !== "visible") return;
       try { const s = await syncGetStatus(); if (s.configured && !s.syncing) await syncTick(); } catch { /* status event carries errors */ }

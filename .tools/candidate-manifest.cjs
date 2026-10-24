@@ -86,6 +86,8 @@ const installation='.build-cache/windows-installer-matrix/installation-results.j
 if(fs.existsSync(path.join(root,installation))){const value=json(installation);installerExecuted=value.executed===true&&value.candidateSha256===artifacts.find(x=>x.file.endsWith('-windows.msi')).sha256&&value.results.every(x=>x.passed);verification.windowsInstallation=evidence(installation,{executed:value.executed,candidateSha256:value.candidateSha256})}
 const ciPackage='.build-cache/github-ci/accepted-package.json';
 if(fs.existsSync(path.join(root,ciPackage)))verification.windowsCiPackage=evidence(ciPackage,{sourceCommit:json(ciPackage).sourceCommit,run:json(ciPackage).run,url:json(ciPackage).url});
+const ciRuntime='.build-cache/windows-installer-evidence/release-runtime.json';
+if(fs.existsSync(path.join(root,ciRuntime)))verification.windowsReleaseRuntime=evidence(ciRuntime);
 const blockers=[
  {id:'windows-installer-matrix',status:installerExecuted?'passed':'pending',detail:'Execute on a disposable authorized Windows runner; local fixtures are preparation evidence only.'},
  {id:'minimum-api-updated-engine',status:'pending',detail:'API26 native startup and old/missing-WebView guidance passed; full functionality with an updated engine on API26 is not yet verified.'},

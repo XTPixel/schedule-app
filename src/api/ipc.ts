@@ -197,6 +197,8 @@ export const syncTakeoverExpired = () => invoke<SyncStatus>("sync_takeover_expir
 export const syncDisconnect = () => invoke<void>("sync_disconnect");
 export const syncExit = () => invoke<void>("sync_exit");
 export const syncForceExit = () => invoke<void>("sync_force_exit");
+export const saveLocalTimerExit = (draft: {updatedAt:number;timers:unknown}) => invoke<void>("save_local_timer_exit", {draft});
+export const loadLocalTimerExit = () => invoke<{updatedAt:number;timers:unknown} | null>("load_local_timer_exit");
 
 // ---- V3.1 ----
 

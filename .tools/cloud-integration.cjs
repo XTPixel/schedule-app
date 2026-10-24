@@ -42,7 +42,12 @@ async function restorePhone(){
  assert.deepEqual(phoneFingerprint(),phoneBefore,'Phone business data differs from the pre-cloud backup');phoneRestored=true;
 }
 async function check(name,fn){const start=Date.now();try{await fn();results.push({name,passed:true,ms:Date.now()-start});console.log('PASS '+name)}catch(error){results.push({name,passed:false,error:String(error)});throw error}}
-async function exit(client){try{await action(client,'sync_exit')}catch(error){if(!/closed/.test(String(error)))throw error}client.close();await wait(600)}
+async function exit(client){
+ await client.evaluate('[...document.querySelectorAll("nav button")].find(x=>x.innerText.includes("设置")).click()');
+ for(let n=0;n<100;n++){if(await client.evaluate('[...document.querySelectorAll("button")].some(x=>x.innerText.trim()==="同步并退出"&&!x.disabled)'))break;assert.ok(n<99,'Visible handoff button must become ready');await wait(100)}
+ try{await client.evaluate('[...document.querySelectorAll("button")].find(x=>x.innerText.trim()==="同步并退出").click()')}catch(error){if(!/closed/.test(String(error)))throw error}
+ for(let n=0;n<300;n++){try{await client.evaluate('true')}catch(error){if(/closed/.test(String(error))){client.close();await wait(600);return}throw error}await wait(100)}throw Error('Visible cloud handoff did not exit');
+}
 async function restartWindows(){
  const evidence=path.join(root,'.build-cache','windows-evidence');
  const child=spawn(exe,[],{windowsHide:true,stdio:'ignore',env:{...process.env,MOMENT_QA_DATA_DIR:path.join(evidence,'data'),APPDATA:path.join(evidence,'roaming'),LOCALAPPDATA:path.join(evidence,'local'),WEBVIEW2_USER_DATA_FOLDER:path.join(evidence,'webview'),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port=9225'}});

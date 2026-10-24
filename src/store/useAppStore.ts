@@ -99,6 +99,7 @@ interface SnoozeEntry {
 }
 
 const TIMER_KEY = "schedule.timers.v1";
+const TIMER_CHECKPOINT_KEY = "schedule.timers.checkpoint.v2";
 const SN_KEY = "schedule.snoozed.v1";
 const skKey = (date: string) => `schedule.skipped.${date}`;
 
@@ -137,6 +138,7 @@ function loadJSON<T>(key: string, fallback: T): T {
 function saveJSON(key: string, value: unknown): void {
   try {
     localStorage.setItem(key, JSON.stringify(value));
+    if (key === TIMER_KEY) localStorage.setItem(TIMER_CHECKPOINT_KEY, JSON.stringify({ updatedAt: Date.now(), timers: value }));
   } catch {
     /* 忽略持久化失败 */
   }
@@ -353,7 +355,8 @@ function setError(msg: string) {
 }
 
 // 初始持久化状态（localStorage 当日有效；跨日由 key 带日期自然失效）。
-const _initTimers = loadJSON<Record<string, TimerState>>(TIMER_KEY, {});
+const _timerCheckpoint = loadJSON<{updatedAt:number;timers:Record<string, TimerState>} | null>(TIMER_CHECKPOINT_KEY, null);
+const _initTimers = _timerCheckpoint?.timers ?? loadJSON<Record<string, TimerState>>(TIMER_KEY, {});
 let _restoredRunningTimer = false;
 for (const t of Object.values(_initTimers)) {
   // 重启后恢复为「暂停」态，保留累计时长（不把关闭期间的时长误算进去）。
@@ -363,7 +366,9 @@ for (const t of Object.values(_initTimers)) {
     _restoredRunningTimer = true;
   }
 }
-if (_restoredRunningTimer) saveJSON(TIMER_KEY, _initTimers);
+// Startup normalization must not make an older WebView checkpoint appear newer
+// than the native, fsynced snapshot captured immediately before a normal exit.
+if (_restoredRunningTimer) localStorage.setItem(TIMER_KEY, JSON.stringify(_initTimers));
 const _initSkipped = new Set(loadJSON<string[]>(skKey(localDateKey()), []));
 // V3.1 T11：稍后集合改为单一 key（含 day 字段），跨零点到期的条目不丢失。
 const _initSnoozed = loadJSON<Record<string, SnoozeEntry>>(SN_KEY, {});
@@ -398,6 +403,15 @@ export const useAppStore = create<AppStore>((set, get) => ({
   async init() {
     set({ loading: true });
     try {
+      try {
+        const exitDraft = await api.loadLocalTimerExit();
+        const checkpoint = loadJSON<{updatedAt:number} | null>(TIMER_CHECKPOINT_KEY, null);
+        if (exitDraft && exitDraft.updatedAt > (checkpoint?.updatedAt ?? 0)) {
+          const timers = exitDraft.timers as Record<string, TimerState>;
+          set({ timers });
+          saveJSON(TIMER_KEY, timers);
+        }
+      } catch (error) { get().pushToast(`退出计时草稿读取失败：${String(error)}`); }
       const data = await api.loadAllData();
       const candidates = await api.getNowCandidates(nowIso());
       set({ data, candidates, loading: false, error: null });

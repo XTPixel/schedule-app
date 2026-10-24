@@ -20,6 +20,7 @@ class Client {
     } catch(error) { client.close(); throw error; }
   }
   command(method,params) {
+    if(this.socket.readyState!==WebSocket.OPEN)return Promise.reject(Error('debug WebView closed'));
     const id=this.next++;
     return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.pending.delete(id);reject(Error('QA command timeout: '+method))},120000);this.pending.set(id,{resolve,reject,timer});this.socket.send(JSON.stringify({id,method,params}))});
   }

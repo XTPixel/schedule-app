@@ -195,6 +195,8 @@ pub fn run() {
             commands::sync_disconnect,
             commands::sync_exit,
             commands::sync_force_exit,
+            commands::save_local_timer_exit,
+            commands::load_local_timer_exit,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -46,19 +46,21 @@ $momentExe=Find-MomentCiFile 'schedule-app.exe'
 $momentInstallFile=Find-MomentCiFile 'installation-results.json';$momentInstall=Read-MomentCiJson $momentInstallFile
 $momentPreparationFile=Find-MomentCiFile 'preparation.json';$momentPreparation=Read-MomentCiJson $momentPreparationFile
 $momentPackageFile=Find-MomentCiFile 'package-results.json';$momentPackage=Read-MomentCiJson $momentPackageFile
+$momentRuntimeFile=Find-MomentCiFile 'release-runtime.json';$momentRuntime=Read-MomentCiJson $momentRuntimeFile
 $momentSummaryFile=Find-MomentCiFile 'summary.json';$momentSummary=Read-MomentCiJson $momentSummaryFile
 if(-not $momentInstall.executed -or $momentInstall.sourceCommit -ne $momentSelected.headSha -or $momentInstall.results.Count -ne 6 -or @($momentInstall.results | Where-Object {-not $_.passed}).Count){throw 'The actual six-case installation matrix did not pass for the selected source commit'}
 if($momentSummary.version -ne $momentVersion -or -not $momentSummary.frontendBuildPassed -or -not $momentSummary.scriptSyntaxPassed -or $momentSummary.rust.total -ne ($momentSummary.rust.app+$momentSummary.rust.core)){throw 'CI build/test summary is invalid'}
 if($momentPackage.results.Count -ne 2 -or @($momentPackage.results | Where-Object {-not $_.passed}).Count){throw 'CI package payload inspection did not pass'}
 $momentMsiHash=Get-MomentCiHash $momentMsi;$momentExeHash=Get-MomentCiHash $momentExe
 if($momentMsiHash -ne $momentInstall.candidateSha256 -or $momentMsiHash -ne $momentPreparation.candidate.sha256 -or $momentMsiHash -ne $momentPackage.msiSha256 -or $momentExeHash -ne $momentPackage.portableExeSha256){throw 'CI files differ from the actual tested package and executable'}
+if(-not $momentRuntime.disposableCiOnly -or $momentRuntime.version -ne $momentVersion -or $momentRuntime.sourceCommit -ne $momentSelected.headSha -or $momentRuntime.binarySha256 -ne $momentExeHash -or $momentRuntime.results.Count -ne 3 -or @($momentRuntime.results | Where-Object {-not $_.passed}).Count){throw 'The optimized Release runtime did not pass for this exact executable'}
 $momentRelease=Join-Path $momentCacheRoot "releases/$momentVersion"
 $momentPrior=Join-Path $momentCiRoot "pre-ci-local/$momentVersion"
 New-Item -ItemType Directory -Force -Path $momentPrior | Out-Null
 $momentDeliverMsi=Join-Path $momentRelease "MOMENT-$momentVersion-windows.msi"
 $momentDeliverExe=Join-Path $momentRelease "MOMENT-$momentVersion-windows-release.exe"
 foreach($momentOld in @($momentDeliverMsi,$momentDeliverExe)){if(Test-Path -LiteralPath $momentOld){$momentOldTarget=Join-Path $momentPrior ([IO.Path]::GetFileName($momentOld));if(-not(Test-Path -LiteralPath $momentOldTarget)){Copy-Item -LiteralPath $momentOld -Destination $momentOldTarget}}}
-foreach($momentProof in @(@($momentPackageFile,'windows-installer-evidence/package-results.json'),@($momentPreparationFile,'windows-installer-matrix/preparation.json'),@($momentInstallFile,'windows-installer-matrix/installation-results.json'))){
+foreach($momentProof in @(@($momentPackageFile,'windows-installer-evidence/package-results.json'),@($momentRuntimeFile,'windows-installer-evidence/release-runtime.json'),@($momentPreparationFile,'windows-installer-matrix/preparation.json'),@($momentInstallFile,'windows-installer-matrix/installation-results.json'))){
     $momentDestination=Join-Path $momentCacheRoot $momentProof[1]
     if(Test-Path -LiteralPath $momentDestination){$momentOldProof=Join-Path $momentPrior $momentProof[1];New-Item -ItemType Directory -Force -Path (Split-Path -Parent $momentOldProof) | Out-Null;Copy-Item -LiteralPath $momentDestination -Destination $momentOldProof -Force}
     Copy-Item -LiteralPath $momentProof[0] -Destination $momentDestination -Force

@@ -2348,6 +2348,38 @@ pub async fn sync_force_exit(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTimerExit {
+    updated_at: u64,
+    timers: serde_json::Value,
+}
+
+fn persist_local_timer_exit(base: &Path, draft: &LocalTimerExit) -> Result<(), String> {
+    let timers = draft.timers.as_object().ok_or("计时草稿格式无效")?;
+    if timers.len() > 4096 || timers.values().any(|timer|
+        timer.get("running").and_then(|v| v.as_bool()) != Some(false)
+        || timer.get("accumulatedMs").and_then(|v| v.as_u64()).is_none()
+    ) { return Err("退出前必须暂停有效的计时草稿".into()); }
+    let bytes = serde_json::to_vec(draft).map_err(|e| e.to_string())?;
+    if bytes.len() > 4 * 1024 * 1024 { return Err("计时草稿过大".into()); }
+    // Local device state lives beside sync.json, outside synchronized business
+    // snapshots. Await fsync and atomic replacement before terminating WebView.
+    crate::sync::atomic_write(&base.join("local-timer-exit.json"), &bytes)
+}
+
+#[tauri::command]
+pub fn save_local_timer_exit(draft: LocalTimerExit, state: State<AppState>) -> Result<(), String> {
+    persist_local_timer_exit(&state.base_dir, &draft)
+}
+
+#[tauri::command]
+pub fn load_local_timer_exit(state: State<AppState>) -> Result<Option<LocalTimerExit>, String> {
+    let path = state.base_dir.join("local-timer-exit.json");
+    if !path.exists() { return Ok(None); }
+    serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map(Some).map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
@@ -2357,6 +2389,20 @@ mod tests {
     use super::*;
     use schedule_core::id::new_id;
     use std::time::SystemTime;
+
+    #[test]
+    fn exit_timer_checkpoint_is_durable_and_rejects_running_replacement() {
+        let dir = std::env::temp_dir().join(format!("moment-exit-draft-{}", new_id("qa")));
+        let draft = LocalTimerExit { updated_at: 42, timers: serde_json::json!({"fixture": {"running":false,"accumulatedMs":1234}}) };
+        persist_local_timer_exit(&dir, &draft).unwrap();
+        let bytes = fs::read(dir.join("local-timer-exit.json")).unwrap();
+        let restored: LocalTimerExit = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.timers["fixture"]["accumulatedMs"], 1234);
+        let invalid = LocalTimerExit { updated_at:43, timers:serde_json::json!({"fixture":{"running":true,"accumulatedMs":1}}) };
+        assert!(persist_local_timer_exit(&dir, &invalid).is_err());
+        assert_eq!(fs::read(dir.join("local-timer-exit.json")).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()

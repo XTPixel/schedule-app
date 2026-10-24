@@ -1,6 +1,6 @@
 [package]
 name = "schedule-app"
-version = "2.0.0-rc.1"
+version = "2.0.0"
 description = "此刻 MOMENT —— Windows 与 Android 个人日程管理"
 edition = "2021"
 
