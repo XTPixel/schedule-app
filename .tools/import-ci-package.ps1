@@ -12,8 +12,11 @@ $momentRun=Read-MomentCiJson (Join-Path $momentCiRoot "run-$($momentSelected.run
 if($momentRun.status -ne 'completed' -or $momentRun.conclusion -ne 'success' -or $momentRun.headSha -ne $momentSelected.headSha){throw 'The selected source-matched CI run has not succeeded'}
 Push-Location $momentProjectRoot
 try {
-    $momentChanged=@(& git diff --name-only $momentSelected.headSha --) + @(& git ls-files --others --exclude-standard)
+    $momentChanged=@(& git -c core.quotepath=false diff --name-only $momentSelected.headSha --)
     if($LASTEXITCODE -ne 0){throw 'Cannot compare candidate sources with the tested CI commit'}
+    $momentOthers=@(& git -c core.quotepath=false ls-files --others --exclude-standard)
+    if($LASTEXITCODE -ne 0){throw 'Cannot inspect untracked application inputs'}
+    $momentChanged+=$momentOthers
     if(@($momentChanged | Where-Object {$_ -and $_ -notmatch '^(?:\.tools/|\.github/|docs/|README\.md$|\.gitignore$)'}).Count){throw 'Application inputs differ from the tested CI commit'}
 } finally {Pop-Location}
 $momentVersion=(Read-MomentCiJson (Join-Path $momentProjectRoot 'package.json')).version

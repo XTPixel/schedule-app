@@ -42,6 +42,13 @@ jobs:
         env:
           MOMENT_ALLOW_INSTALLER_QA: '1'
         run: ./.tools/windows-installer-matrix.ps1 -Execute
+      - name: Check optimized Release cold start and persisted data
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/codex/release-2-0-rc1')
+        env:
+          MOMENT_ALLOW_INSTALLER_QA: '1'
+        run: |
+          . ./.tools/build-env.ps1
+          node ./.tools/windows-release-runtime.cjs
       - name: Retain installer evidence
         if: always() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/codex/release-2-0-rc1'))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

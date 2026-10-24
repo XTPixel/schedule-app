@@ -120,7 +120,7 @@ npm run build
 
 ### 环境要求
 
-- Windows 10 / 11及可用的现代WebView2运行时；本轮Windows10已测试，Windows11待实测
+- Windows10及可用的现代WebView2运行时；Windows11兼容性未验证，本轮按用户决定不进行该平台实测
 - 已验证的构建工具链：Node.js 24.14.1、npm、Rust 1.97.1（MSVC）
 - Visual Studio Build Tools（含「使用 C++ 的桌面开发」组件）
 - Android最低API26，需可用且更新到现代版本的系统WebView；本轮使用JDK17、NDK29和target API36构建
