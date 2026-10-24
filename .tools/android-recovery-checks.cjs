@@ -39,6 +39,7 @@ async function choosePicker(name){
  tap(selected);await wait(250);
 }
 async function main(){
+ await require('./emulator-system-ui-ready.cjs')(serial);
  shell('shell','input','keyevent','KEYCODE_WAKEUP');
  client=await attach();
  assert.equal((await client.invoke('sync_get_status')).configured,false);

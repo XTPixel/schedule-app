@@ -1,5 +1,6 @@
 // Bind delivered bytes to their source inventory and actual acceptance evidence.
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto'),assert=require('node:assert/strict');
+const{execFileSync}=require('node:child_process');
 const root=path.resolve(__dirname,'..'),version=require('../package.json').version,out=path.join(root,'.build-cache/releases',version);
 const read=file=>JSON.parse(fs.readFileSync(file,'utf8').replace(/^\uFEFF/,'')),sha=b=>crypto.createHash('sha256').update(b).digest('hex');
 function local(relative){assert.ok(typeof relative==='string'&&!path.isAbsolute(relative)&&!relative.split(/[\\/]/).includes('..'),'Expected a project-relative file');return path.join(root,relative)}
@@ -59,14 +60,24 @@ assert.equal(upgrade.installed.versionName,version);assert.ok(upgrade.installed.
 const target=read(local(manifest.verification.androidTargetEnvironment.file));
 assert.equal(target.api,36);assert.equal(target.nativeVersion,version);assert.equal(target.installedApkSha256,artifact('-x86_64-debug.apk').sha256);
 const phone=read(local(manifest.verification.phoneDataIntegrity.file));assert.equal(phone.originalBusinessVerified,true);assert.equal(phone.filesVerified,7);
+assert.equal(phone.installedApkSha256,artifact('-arm64-debug.apk').sha256,'The protected original phone app must contain the final tested Debug bytes');
+assert.equal(read(local(manifest.verification.windowsHandoff.file)).binarySha256,artifact('-windows-debug.exe').sha256);
+assert.equal(read(local(manifest.verification.cloudRoundtrip.file)).windowsBinarySha256,artifact('-windows-debug.exe').sha256);
+assert.equal(read(local(manifest.verification.cloudContention.file)).windowsBinarySha256,artifact('-windows-debug.exe').sha256);
 assert.equal(manifest.verification.cloudRoundtrip.phoneOriginalDataVerified,true);
 assert.equal(manifest.verification.cloudExpiry.realLeaseExpiry,true);assert.equal(manifest.verification.cloudExpiryCleanup.passed,1);
 const installer=read(local(manifest.verification.windowsInstallerPackage.file));
 assert.equal(installer.msiSha256,artifact('-windows.msi').sha256);assert.equal(installer.portableExeSha256,artifact('-windows-release.exe').sha256);
 const preparation=read(local(manifest.verification.windowsInstallerPreparation.file));assert.equal(preparation.executed,false);assert.equal(preparation.candidate.sha256,installer.msiSha256);
 if(manifest.verification.windowsInstallation){const actual=read(local(manifest.verification.windowsInstallation.file));assert.equal(actual.executed,true);assert.equal(actual.candidateSha256,installer.msiSha256);assert.equal(actual.results.length,6)}
-if(manifest.verification.windowsCiPackage){const ci=read(local(manifest.verification.windowsCiPackage.file));assert.equal(ci.msiSha256,installer.msiSha256);assert.equal(ci.exeSha256,installer.portableExeSha256);assert.equal(ci.sourceCommit,read(local(manifest.verification.windowsInstallation.file)).sourceCommit)}
+if(manifest.verification.windowsCiPackage){
+ const ci=read(local(manifest.verification.windowsCiPackage.file));assert.equal(ci.msiSha256,installer.msiSha256);assert.equal(ci.exeSha256,installer.portableExeSha256);assert.equal(ci.sourceCommit,read(local(manifest.verification.windowsInstallation.file)).sourceCommit);assert.match(ci.sourceCommit,/^[0-9a-f]{40}$/);
+ const git=(...args)=>execFileSync('git',args,{cwd:root,encoding:'utf8',maxBuffer:8*1024*1024}).split('\0').filter(Boolean);
+ const changed=[...git('diff','--name-only','-z',ci.sourceCommit,'--'),...git('ls-files','--others','--exclude-standard','-z')];
+ assert.ok(changed.every(file=>/^(?:\.tools\/|\.github\/|docs\/|README\.md$|\.gitignore$)/.test(file)),'Product inputs changed after the successful CI build');
+}
 if(manifest.verification.windowsReleaseRuntime){const runtime=read(local(manifest.verification.windowsReleaseRuntime.file));assert.equal(runtime.binarySha256,installer.portableExeSha256);assert.equal(runtime.results.length,3);assert.equal(runtime.version,version)}
+if(manifest.verification.acceptanceMatrix){const matrix=read(local(manifest.verification.acceptanceMatrix.file));assert.equal(matrix.version,version);assert.equal(matrix.results.length,16);verifyFact(matrix.unitSummary);verifyFact(matrix.testInventory);for(const entry of matrix.evidence)verifyFact(entry)}
 const performance=manifest.verification.performance;assert.ok(performance.items>=10000&&performance.archiveMonths>=24&&performance.writeSamples>=20);assert.ok(performance.writeP95Ms<=300);
 const soak=manifest.sustainedStability;
 if(soak){verifyFact(soak);assert.equal(soak.version,version);assert.equal(soak.binarySha256,artifact('-windows-debug.exe').sha256)}

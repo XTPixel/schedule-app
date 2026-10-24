@@ -65,6 +65,8 @@ npm run build
 
 本机缓存、临时文件、Gradle、Rust 工具链和目标文件使用 D 盘。NDK 对中文路径的限制通过 `D:\moment-native-build` 处理；SDK/JDK 原有安装只作为工具读取。模拟器及镜像位于 `D:\moment-build\android-sdk`，AVD 位于同盘。Android 构建脚本可在原生库编译成功、系统禁止创建符号链接时复制原生库后继续打包，无需打开 Windows 开发者模式。
 
+设备隔离、测试执行顺序、实际CI文件接收和最终清单生成见[构建与验收工具说明](.tools/README.md)。
+
 它把事件、日常、浮动事项和长期任务与候选推荐引擎结合，帮助选择现在最适合处理的事项。
 
 ## 功能特性

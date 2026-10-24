@@ -10,7 +10,7 @@ const binarySha256=crypto.createHash('sha256').update(fs.readFileSync(exe)).dige
 function record(phase,extra={}){const value={recordedAt:new Date().toISOString(),version,phase,startedAt,requiredDurationMs:durationMs,elapsedMs:startedAt?Date.now()-Date.parse(startedAt):0,cycles,binarySha256,isolatedDirectory:dir,samples,checks,...extra};fs.writeFileSync(path.join(out,'progress.json'),JSON.stringify(value,null,2));fs.writeFileSync(path.join(root,'.build-cache/windows-soak/latest.json'),JSON.stringify(value,null,2));return value}
 async function until(fn){for(let n=0;n<80;n++){try{if(await fn())return}catch{}await wait(200)}throw Error('Soak application state did not become ready')}
 async function main(){
- try{await fetch('http://127.0.0.1:9226/json/list');throw Error('QA port 9226 is already in use')}catch(e){if(/already in use/.test(String(e)))throw e}
+ await Client.assertPortFree(9226);
  child=spawn(exe,[],{windowsHide:true,stdio:'ignore',env:{...process.env,MOMENT_QA_DATA_DIR:dir,APPDATA:path.join(out,'roaming'),LOCALAPPDATA:path.join(out,'local'),WEBVIEW2_USER_DATA_FOLDER:path.join(out,'webview'),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port=9226'}});
  await until(async()=>{client=await Client.connect(9226);return Boolean(await client.invoke('load_all_data'))});
  await client.assertWindowsIsolation();

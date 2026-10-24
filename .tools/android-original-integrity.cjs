@@ -9,5 +9,7 @@ for(const entry of baseline){
  const raw=execFileSync(adb,['-s',serial,'exec-out','run-as','com.personal.schedule','cat',entry.file],{timeout:30000,maxBuffer:32*1024*1024});
  const sha=crypto.createHash('sha256').update(canonical(JSON.parse(raw))).digest('hex');assert.equal(sha,entry.sha256,'Original file changed: '+entry.file);
 }
-fs.writeFileSync(path.join(root,'.build-cache/honor70-evidence/post-ui-integrity.json'),JSON.stringify({recordedAt:new Date().toISOString(),serial,originalBusinessVerified:true,filesVerified:baseline.length},null,2));
+const installedPath=execFileSync(adb,['-s',serial,'shell','pm','path','com.personal.schedule'],{encoding:'utf8',timeout:30000}).trim().replace(/^package:/,'');assert.match(installedPath,/^\/data\/app\/[A-Za-z0-9_\/=+~.-]+\/base\.apk$/);
+const installedApkSha256=execFileSync(adb,['-s',serial,'shell','sha256sum',installedPath],{encoding:'utf8',timeout:30000}).trim().split(/\s+/)[0];assert.match(installedApkSha256,/^[0-9a-f]{64}$/);
+fs.writeFileSync(path.join(root,'.build-cache/honor70-evidence/post-ui-integrity.json'),JSON.stringify({recordedAt:new Date().toISOString(),serial,originalBusinessVerified:true,filesVerified:baseline.length,installedApkSha256},null,2));
 console.log('PASS all '+baseline.length+' original phone business JSON fingerprints match the pre-cloud baseline');

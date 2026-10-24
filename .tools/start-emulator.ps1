@@ -1,11 +1,13 @@
-param([ValidateRange(2048,4096)][int]$MemoryMB=3072)
+param([ValidateRange(2048,4096)][int]$MemoryMB=3072,[ValidateSet('Moment_API35','Moment_API36')][string]$Avd='Moment_API35')
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'build-env.ps1')
 $momentEmulatorSdk=Join-Path $momentCacheRoot 'android-sdk'
 $momentEmulator=Join-Path $momentEmulatorSdk 'emulator/emulator.exe'
-$momentSystemImage=Join-Path $momentEmulatorSdk 'system-images/android-35/google_apis/x86_64/system.img'
-if(-not (Test-Path -LiteralPath $momentSystemImage)){throw 'The project Android 35 system image is missing on D:'}
-if(-not (Test-Path -LiteralPath (Join-Path $env:ANDROID_AVD_HOME 'Moment_API35.avd/config.ini'))){throw 'The project AVD is missing'}
+$momentApi=if($Avd -eq 'Moment_API35'){35}else{36}
+$momentPort=if($momentApi -eq 35){5554}else{5558}
+$momentSystemImage=Join-Path $momentEmulatorSdk "system-images/android-$momentApi/google_apis/x86_64/system.img"
+if(-not (Test-Path -LiteralPath $momentSystemImage)){throw 'The selected project system image is missing on D:'}
+if(-not (Test-Path -LiteralPath (Join-Path $env:ANDROID_AVD_HOME "$Avd.avd/config.ini"))){throw 'The project AVD is missing'}
 # Never start a second emulator against an AVD that may already be running.
 if(Get-Process -Name emulator -ErrorAction SilentlyContinue){throw 'An emulator is already running; inspect it before starting another'}
 $momentOldAndroidHome=$env:ANDROID_HOME
@@ -15,7 +17,7 @@ try {
     # project SDK, while builds keep using the existing read-only C: tool SDK.
     $env:ANDROID_HOME=$momentEmulatorSdk
     $env:ANDROID_SDK_ROOT=$momentEmulatorSdk
-    Start-Process -FilePath $momentEmulator -ArgumentList @('-avd','Moment_API35','-no-window','-no-snapshot','-no-audio','-gpu','swiftshader','-memory',"$MemoryMB",'-cores','2') -WindowStyle Hidden -RedirectStandardOutput (Join-Path $momentCacheRoot 'emulator-runtime.log') -RedirectStandardError (Join-Path $momentCacheRoot 'emulator-runtime-error.log') -PassThru | Select-Object Id,ProcessName
+    Start-Process -FilePath $momentEmulator -ArgumentList @('-avd',$Avd,'-port',"$momentPort",'-no-window','-no-snapshot','-no-audio','-gpu','swiftshader','-memory',"$MemoryMB",'-cores','2') -WindowStyle Hidden -RedirectStandardOutput (Join-Path $momentCacheRoot "emulator-$momentApi-runtime.log") -RedirectStandardError (Join-Path $momentCacheRoot "emulator-$momentApi-runtime-error.log") -PassThru | Select-Object Id,ProcessName
 } finally {
     $env:ANDROID_HOME=$momentOldAndroidHome
     $env:ANDROID_SDK_ROOT=$momentOldSdkRoot

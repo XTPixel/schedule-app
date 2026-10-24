@@ -29,7 +29,7 @@ async function main(){
  await check('BUG-19 invalid inline due date restores the actual persisted date',async()=>{
    await nav('长期');await until(()=>client.evaluate('document.querySelectorAll("main input[type=date]").length>=2'));
    // Date inputs have separate wrappers; select the last owned page date input.
-   await client.evaluate('window.__qaDue=[...document.querySelectorAll("main input[type=date]")].at(-1);Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value").set.call(window.__qaDue,"2000-01-01");window.__qaDue.dispatchEvent(new Event("input",{bubbles:true}));window.__qaDue.dispatchEvent(new Event("change",{bubbles:true}));window.__qaDue.focus();true');await wait(30);
+   await client.evaluate('window.__qaDue=[...document.querySelectorAll("main input[type=date]")].at(-1);window.__qaDue.focus();Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value").set.call(window.__qaDue,"2000-01-01");window.__qaDue.dispatchEvent(new Event("input",{bubbles:true}));window.__qaDue.dispatchEvent(new Event("change",{bubbles:true}));true');await wait(200);
    await client.evaluate('window.__qaDue.blur();true');
    await until(()=>client.evaluate('document.body.innerText.includes("截止日期不能早于开始日期")'));
    assert.equal(await client.evaluate('window.__qaDue.value'),day);assert.equal((await client.invoke('load_all_data')).longTasks.find(x=>x.id===long.id).dueDate,day);
@@ -111,7 +111,8 @@ async function main(){
  });
  await check('BUG-03 an overnight paused timer records effective time and refreshes statistics',async()=>{
    const saved=(await client.invoke('load_all_data')).longTasks.find(x=>x.id===long.id);await client.invoke('save_long_task',{task:{...saved,startDate:new Date(Date.now()-2*86400000).toISOString().slice(0,10)}});
-   await client.evaluate('localStorage.setItem("schedule.timers.v1",'+JSON.stringify(JSON.stringify({[long.id]:{sourceType:'longtask',title:long.title,startedAt:0,accumulatedMs:3600000,running:false,sessionStartedAt:Date.now()-26*3600000,sessionId:'qa-overnight-paused'}}))+');location.reload();true');
+   const timers={[long.id]:{sourceType:'longtask',title:long.title,startedAt:0,accumulatedMs:3600000,running:false,sessionStartedAt:Date.now()-26*3600000,sessionId:'qa-overnight-paused'}};
+   await client.evaluate('(()=>{const timers='+JSON.stringify(timers)+';localStorage.setItem("schedule.timers.v1",JSON.stringify(timers));localStorage.setItem("schedule.timers.checkpoint.v2",JSON.stringify({updatedAt:Date.now()+1,timers}));location.reload()})()');
    await until(()=>client.evaluate('Boolean(document.querySelector("nav button"))'));await nav('统计');await until(()=>client.evaluate('document.querySelector("main").innerText.includes("总耗时")'));await nav('现在');
    await until(()=>client.evaluate('[...document.querySelectorAll("main button")].some(x=>x.innerText.trim()==="终止")'));
    await client.evaluate('[...document.querySelectorAll("main button")].find(x=>x.innerText.trim()==="终止").click()');
@@ -132,7 +133,7 @@ async function main(){
    const restored=await client.evaluate('JSON.parse(localStorage.getItem("schedule.timers.v1"))['+JSON.stringify(long.id)+']');assert.equal(restored.running,false);assert.equal(restored.startedAt,0);assert.ok(restored.accumulatedMs>=before.accumulatedMs&&restored.accumulatedMs<before.accumulatedMs+3000);
  });
  await check('BUG-20 simultaneous external-change prompts keep both operations resolvable',async()=>{
-   await client.evaluate('localStorage.removeItem("schedule.timers.v1");true');
+   await client.evaluate('localStorage.removeItem("schedule.timers.v1");localStorage.removeItem("schedule.timers.checkpoint.v2");true');
    const common={id:'',description:null,tags:['qa-external-queue'],priority:'high',deadline:null,sortOrder:0,status:'active',createdAt:now,updatedAt:now,completedAt:null,deletedAt:null};
    const a=await client.invoke('save_task',{task:{...common,title:'QA external first'}}),b=await client.invoke('save_task',{task:{...common,title:'QA external second'}});
    await client.evaluate('location.reload();true');await until(()=>client.evaluate('document.querySelector("main")?.innerText.includes("QA external second")'));

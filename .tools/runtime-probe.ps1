@@ -1,8 +1,9 @@
 # Reuse exact optimized bytes from a failed runtime test to debug CI quickly.
-param([long]$Run=40089652408)
+param([Parameter(Mandatory=$true)][long]$Run)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'build-env.ps1')
 if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:MOMENT_ALLOW_INSTALLER_QA -ne '1' -or $env:GITHUB_REPOSITORY -ne 'XTPixel/schedule-app'){throw 'This probe runs only in the authorized disposable GitHub runner'}
+if($Run -le 0){throw 'A positive source run ID is required'}
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $momentApi='https://api.github.com/repos/XTPixel/schedule-app'
 $momentHeaders=@{Authorization=('Bearer '+$env:MOMENT_CI_TOKEN);Accept='application/vnd.github+json';'User-Agent'='moment-runtime-probe'}

@@ -26,6 +26,10 @@ async function pickFault(folder){
 }
 async function main(){
  assert.equal(shell('emu','avd','name').trim().split(/\s+/)[0],'Moment_API35');
+ await require('./emulator-system-ui-ready.cjs')(serial);
+ // Clear only this emulator app's abandoned activity-result callback after a
+ // failed/OS-blocked picker attempt; business files remain intact.
+ shell('shell','am','force-stop',pkg);
  assert.match(shell('shell','dumpsys','package','com.personal.schedule.safqa'),/versionName=1.0/);
  await attach();assert.equal(await client.invoke('plugin:app|version'),require('../package.json').version);assert.equal((await client.invoke('sync_get_status')).configured,false);
  before=await client.invoke('load_all_data');

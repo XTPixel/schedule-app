@@ -3,7 +3,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
 const {execFileSync}=require('node:child_process');const {Client}=require('./webview-qa-client.cjs');
 const serial=process.env.MOMENT_EMULATOR||'emulator-5554';assert.ok(serial.startsWith('emulator-'));
 const releaseQa=process.env.MOMENT_NOTIFICATION_RELEASE_QA==='1';
-const qaPort=releaseQa?9225:Number(process.env.MOMENT_ANDROID_QA_PORT||9223);assert.ok([9223,9225,9227].includes(qaPort));
+const qaPort=releaseQa?9231:Number(process.env.MOMENT_ANDROID_QA_PORT||9223);assert.ok([9223,9227,9231].includes(qaPort));
 const adb=path.join(process.env.ANDROID_HOME,'platform-tools/adb.exe'),pkg=releaseQa?'com.personal.schedule.qa':'com.personal.schedule';
 const activity=releaseQa?pkg+'/com.personal.schedule.MainActivity':pkg+'/.MainActivity';
 const out=path.resolve(__dirname,'../.build-cache/'+(releaseQa?'android-release-notification-evidence':'android-evidence'));fs.mkdirSync(out,{recursive:true});
