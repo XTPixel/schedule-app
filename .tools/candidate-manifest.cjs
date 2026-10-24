@@ -52,6 +52,7 @@ const verification={
  androidHandoff:evidence('.build-cache/handoff-evidence/android.json'),
  emulator:evidence('.build-cache/android-evidence/smoke-results.json',{api:36}),
  recovery:evidence('.build-cache/android-evidence/recovery-checks.json',{api:36}),
+ androidSafFailures:evidence('.build-cache/android-evidence/saf-failure-results.json'),
  androidNotifications:evidence('.build-cache/android-evidence/notification-results.json'),
  androidReleaseNotifications:evidence('.build-cache/android-release-notification-evidence/notification-results.json'),
  androidPackageStructure:evidence('.build-cache/android-package-evidence/package-results.json'),

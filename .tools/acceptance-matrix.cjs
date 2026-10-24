@@ -18,7 +18,7 @@ const definitions=[
  ['download-does-not-become-dirty',['first_empty_device_downloads_without_prompt_or_upload'],['cloud-evidence/roundtrip.json']],
  ['corruption-and-wrong-password',['bad_nonce_returns_error_instead_of_panicking','encrypted_roundtrip_and_tamper_detection','corrupt_state_and_profile_fail_closed'],['android-evidence/recovery-checks.json']],
  ['path-and-payload-validation',['rejects_paths_and_bad_json_before_writing'],['android-evidence/recovery-checks.json']],
- ['write-failure-and-interrupted-transaction',['isolated_edit_failure_leaves_all_live_files_and_config_unchanged','recovers_interrupted_transaction_including_config'],['android-evidence/recovery-checks.json']],
+ ['write-failure-and-interrupted-transaction',['isolated_edit_failure_leaves_all_live_files_and_config_unchanged','recovers_interrupted_transaction_including_config'],['android-evidence/recovery-checks.json','android-evidence/saf-failure-results.json']],
  ['android-background-and-restart',[],['android-evidence/lifecycle-results.json','honor70-evidence/project-certificate/upgrade.json']],
  ['delete-and-undo-roundtrip',['complete_snapshot_removes_stale_files_and_is_idempotent'],['cloud-evidence/roundtrip.json','windows-evidence/ui-results.json']],
  ['credentials-and-device-settings',['credential_update_failure_preserves_active_profile_and_all_old_secrets','missing_credential_is_detected_before_any_writes_and_success_keeps_device_id','credentials_are_not_snapshot_fields'],['android-evidence/smoke-results.json','cloud-evidence/roundtrip.json']]
