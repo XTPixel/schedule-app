@@ -745,6 +745,21 @@ impl SyncService {
         )
     }
 
+    /// The final exit boundary shares the same storage lock as every business
+    /// mutation. Recheck the actual fingerprint and freeze writers atomically;
+    /// an upload completing with newer pending edits must retain its lease.
+    pub fn freeze_clean_exit(&self, storage: &Mutex<Storage>) -> Result<(), String> {
+        local(storage, |s| {
+            self.mark_dirty(s)?;
+            let mut state = self.read_state()?;
+            if state.dirty {
+                return Err("退出同步期间有新的本地修改，请返回应用再次同步后退出".into());
+            }
+            state.ready = false;
+            self.save_state(&state)
+        })
+    }
+
     pub fn release(&self, storage: &Mutex<Storage>) -> Result<(), String> {
         let Some(profile) = self.read_profile()? else {
             return Ok(());
@@ -1878,6 +1893,8 @@ mod safety_tests {
         }));
         let result = service.sync_using(&storage, &remote, None, false).unwrap();
         assert!(result.dirty);
+        assert!(service.freeze_clean_exit(&storage).is_err());
+        assert!(service.status().editable, "a rejected exit must retain its valid editing lease");
         assert!(!remote
             .payload
             .lock()
@@ -1893,6 +1910,27 @@ mod safety_tests {
             .unwrap()
             .tag_colors
             .contains_key("during-upload"));
+        service.freeze_clean_exit(&storage).unwrap();
+        assert!(!service.status().editable);
+        assert!(service.prepare_write().is_err(), "new mutations must be blocked before lease release starts");
+        fs::remove_dir_all(service.base_dir).unwrap();
+    }
+    #[test]
+    fn exit_freeze_rechecks_changes_after_a_clean_sync() {
+        let (service, storage, payload) = sync_fixture();
+        let remote = FakeRemote::new(payload, Some(1));
+        assert!(!service.sync_using(&storage, &remote, None, false).unwrap().dirty);
+        {
+            let mut s = storage.lock().unwrap();
+            let mut config = s.read_config().unwrap();
+            config.tag_colors.insert("changed-after-sync".into(), "blue".into());
+            s.save_config(&config).unwrap();
+        }
+        assert!(!service.read_state().unwrap().dirty, "the guard must not trust a previously clean flag");
+        assert!(service.freeze_clean_exit(&storage).is_err());
+        assert!(service.status().dirty);
+        assert!(service.status().editable);
+        assert!(service.read_state().unwrap().held_lease.is_some());
         fs::remove_dir_all(service.base_dir).unwrap();
     }
     #[test]

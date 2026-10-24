@@ -3,7 +3,7 @@ const fs=require('node:fs'),path=require('node:path'),assert=require('node:asser
 const root=path.resolve(__dirname,'..'),version=require('../package.json').version,out='.build-cache/verification';
 const json=file=>JSON.parse(fs.readFileSync(path.join(root,file),'utf8').replace(/^\uFEFF/,''));
 const fact=file=>({file,sha256:crypto.createHash('sha256').update(fs.readFileSync(path.join(root,file))).digest('hex')});
-const summary=json(out+'/summary.json');assert.equal(summary.version,version);assert.ok(summary.rust.app>=53&&summary.rust.core>=49);
+const summary=json(out+'/summary.json');assert.equal(summary.version,version);assert.ok(summary.rust.app>=54&&summary.rust.core>=49);
 const inventory=fs.readFileSync(path.join(root,out,'app-test-inventory.txt'),'utf8');
 const definitions=[
  ['local-only',[],['windows-evidence/smoke-results.json','android-evidence/smoke-results.json','handoff-evidence/windows.json','handoff-evidence/android.json']],
@@ -12,7 +12,7 @@ const definitions=[
  ['concurrent-claim-and-publish',['simultaneous_claims_have_exactly_one_winner','stale_revision_or_lease_cannot_publish'],['cloud-evidence/windows-contention.json']],
  ['expired-lease-rejects-old-owner',['expired_takeover_requires_confirmation_and_invalidates_the_old_owner','expired_local_owner_must_reconcile_before_becoming_editable_again'],['cloud-evidence/windows-expiry.json','cloud-evidence/expiry-cleanup.json']],
  ['stale-base-preserves-new-remote',['stale_revision_or_lease_cannot_publish','download_does_not_replace_edit_made_during_network'],['cloud-evidence/windows-contention.json']],
- ['immediate-exit-and-process-death',['writable_only_after_initial_sync_and_durable_dirty_before_write','exit_timer_checkpoint_is_durable_and_rejects_running_replacement'],['cloud-evidence/roundtrip.json','handoff-evidence/android.json','windows-evidence/followup-ui-results.json']],
+ ['immediate-exit-and-process-death',['writable_only_after_initial_sync_and_durable_dirty_before_write','exit_timer_checkpoint_is_durable_and_rejects_running_replacement','exit_freeze_rechecks_changes_after_a_clean_sync'],['cloud-evidence/roundtrip.json','handoff-evidence/android.json','windows-evidence/followup-ui-results.json']],
  ['commit-acknowledgement-failure',['acknowledged_content_retry_does_not_publish_a_second_revision'],[]],
  ['edit-during-transfer',['upload_releases_storage_and_preserves_edits_until_next_commit','download_does_not_replace_edit_made_during_network'],[]],
  ['download-does-not-become-dirty',['first_empty_device_downloads_without_prompt_or_upload'],['cloud-evidence/roundtrip.json']],

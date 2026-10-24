@@ -2332,6 +2332,7 @@ pub async fn sync_exit(app: AppHandle) -> Result<(), String> {
     run_sync(app.clone(), |s, storage| {
         if s.status().configured {
             s.sync(storage, false)?;
+            s.freeze_clean_exit(storage)?;
             s.release(storage)?;
         }
         Ok(s.status())
