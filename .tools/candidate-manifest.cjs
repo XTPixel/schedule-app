@@ -57,6 +57,7 @@ const verification={
  androidMinimumCompatibility:evidence('.build-cache/api26-evidence/compatibility-results.json'),
  androidTargetEnvironment:evidence('.build-cache/android-evidence/target-environment.json'),
  androidTargetLayout:evidence('.build-cache/android-evidence/layout-results.json'),
+ androidLifecycle:evidence('.build-cache/android-evidence/lifecycle-results.json'),
  phoneUi:evidence('.build-cache/honor70-evidence/ui-results.json'),
  phoneRelease:evidence('.build-cache/honor70-evidence/release-results.json'),
  phoneProjectBaseline:evidence('.build-cache/honor70-evidence/project-certificate/baseline.json'),
@@ -83,9 +84,10 @@ if(fs.existsSync(path.join(root,'.build-cache/windows-soak/latest.json'))){
 let installerExecuted=false;
 const installation='.build-cache/windows-installer-matrix/installation-results.json';
 if(fs.existsSync(path.join(root,installation))){const value=json(installation);installerExecuted=value.executed===true&&value.candidateSha256===artifacts.find(x=>x.file.endsWith('-windows.msi')).sha256&&value.results.every(x=>x.passed);verification.windowsInstallation=evidence(installation,{executed:value.executed,candidateSha256:value.candidateSha256})}
+const ciPackage='.build-cache/github-ci/accepted-package.json';
+if(fs.existsSync(path.join(root,ciPackage)))verification.windowsCiPackage=evidence(ciPackage,{sourceCommit:json(ciPackage).sourceCommit,run:json(ciPackage).run,url:json(ciPackage).url});
 const blockers=[
  {id:'windows-installer-matrix',status:installerExecuted?'passed':'pending',detail:'Execute on a disposable authorized Windows runner; local fixtures are preparation evidence only.'},
- {id:'windows11-desktop',status:'pending',detail:'Windows10 is tested; a Windows Server CI run does not establish Windows11 desktop compatibility.'},
  {id:'minimum-api-updated-engine',status:'pending',detail:'API26 native startup and old/missing-WebView guidance passed; full functionality with an updated engine on API26 is not yet verified.'},
  {id:'rc-three-day-trial',status:'pending',minimumElapsedMs:259200000},
  {id:'remaining-acceptance-combinations',status:'pending',detail:'See unchecked items in docs/V2.0_Lite_完整开发与验收计划.md.'}
@@ -97,6 +99,7 @@ const manifest={
  sourceFiles:sources.length,sourceManifestSha256:sha(sourceBytes),formalRelease:false,
  android:{minSdk:Number(androidProof.match(/sdkVersion:'(\d+)'/)[1]),targetSdk:Number(androidProof.match(/targetSdkVersion:'(\d+)'/)[1]),versionCode:Number(versionMatch[1]),versionName:version},
  androidSigning,windowsSigning:'No Authenticode signature',
+ platformScope:{windowsDesktop:'Windows10 verified; Windows11 untested and explicitly excluded from this release acceptance by the user on 2026-10-24'},
  toolchain:{node:process.version,rust:'1.97.1',jdk:'17.0.20.1',ndk:'29.0.13846066',gradle:'8.14.3'},
  recommendedInstallers:{android:`MOMENT-${version}-arm64-release.apk`,windows:`MOMENT-${version}-windows.msi`},
  cloudVerification:'Latest RC1 two-client contention and Windows-HONOR70 complete roundtrip passed. Actual production-lease expiry has earlier protocol evidence plus verified cleanup; exact evidence dates are retained.',

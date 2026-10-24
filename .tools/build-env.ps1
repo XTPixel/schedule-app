@@ -9,6 +9,9 @@ if($PSVersionTable.PSVersion.Major -le 5){
     }
 }
 $momentProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+if([IO.Path]::GetPathRoot($momentProjectRoot) -eq 'C:\'){
+    throw 'Project build output must stay off C:. Use the existing D: checkout before building.'
+}
 $momentCacheRoot = Join-Path $momentProjectRoot '.build-cache'
 if (Test-Path -LiteralPath 'D:\moment-build\cargo-target') {
     $momentCacheRoot = 'D:\moment-build'

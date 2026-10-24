@@ -61,6 +61,8 @@ assert.equal(manifest.verification.cloudExpiry.realLeaseExpiry,true);assert.equa
 const installer=read(local(manifest.verification.windowsInstallerPackage.file));
 assert.equal(installer.msiSha256,artifact('-windows.msi').sha256);assert.equal(installer.portableExeSha256,artifact('-windows-release.exe').sha256);
 const preparation=read(local(manifest.verification.windowsInstallerPreparation.file));assert.equal(preparation.executed,false);assert.equal(preparation.candidate.sha256,installer.msiSha256);
+if(manifest.verification.windowsInstallation){const actual=read(local(manifest.verification.windowsInstallation.file));assert.equal(actual.executed,true);assert.equal(actual.candidateSha256,installer.msiSha256);assert.equal(actual.results.length,6)}
+if(manifest.verification.windowsCiPackage){const ci=read(local(manifest.verification.windowsCiPackage.file));assert.equal(ci.msiSha256,installer.msiSha256);assert.equal(ci.exeSha256,installer.portableExeSha256);assert.equal(ci.sourceCommit,read(local(manifest.verification.windowsInstallation.file)).sourceCommit)}
 const performance=manifest.verification.performance;assert.ok(performance.items>=10000&&performance.archiveMonths>=24&&performance.writeSamples>=20);assert.ok(performance.writeP95Ms<=300);
 const soak=manifest.sustainedStability;
 if(soak){verifyFact(soak);assert.equal(soak.version,version);assert.equal(soak.binarySha256,artifact('-windows-debug.exe').sha256)}
