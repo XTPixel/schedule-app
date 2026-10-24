@@ -20,7 +20,7 @@ const signatures={
  'arm64-release.apk':'Release optimization, dedicated MOMENT application signing certificate; see androidSigning for key-backup status',
  'windows-debug.exe':'Unsigned Debug QA; explicit marked test directory supported',
  'windows-release.exe':'Unsigned Release; debug-only QA directory override is ignored',
- 'windows.msi':'Unsigned Release installer; installation/rollback pending'
+ 'windows.msi':'Unsigned Release installer; see the exact-byte installation and rollback evidence'
 };
 const artifacts=fs.readdirSync(out).filter(name=>/\.(apk|msi|exe)$/.test(name)).sort().map(name=>{
  const file=path.join(out,name),stat=fs.statSync(file),key=Object.keys(signatures).find(key=>name.endsWith(key));
@@ -48,6 +48,8 @@ const verification={
  windowsUi:evidence('.build-cache/windows-evidence/ui-results.json'),
  windowsFollowupUi:evidence('.build-cache/windows-evidence/followup-ui-results.json'),
  windowsLifecycle:evidence('.build-cache/windows-lifecycle/latest.json'),
+ windowsHandoff:evidence('.build-cache/handoff-evidence/windows.json'),
+ androidHandoff:evidence('.build-cache/handoff-evidence/android.json'),
  emulator:evidence('.build-cache/android-evidence/smoke-results.json',{api:36}),
  recovery:evidence('.build-cache/android-evidence/recovery-checks.json',{api:36}),
  androidNotifications:evidence('.build-cache/android-evidence/notification-results.json'),
@@ -88,11 +90,13 @@ const ciPackage='.build-cache/github-ci/accepted-package.json';
 if(fs.existsSync(path.join(root,ciPackage)))verification.windowsCiPackage=evidence(ciPackage,{sourceCommit:json(ciPackage).sourceCommit,run:json(ciPackage).run,url:json(ciPackage).url});
 const ciRuntime='.build-cache/windows-installer-evidence/release-runtime.json';
 if(fs.existsSync(path.join(root,ciRuntime)))verification.windowsReleaseRuntime=evidence(ciRuntime);
+const matrixFile='.build-cache/verification/acceptance-matrix.json';
+let matrixPassed=false;
+if(fs.existsSync(path.join(root,matrixFile))){const value=json(matrixFile);matrixPassed=value.version===version&&value.results.length===16&&value.results.every(x=>x.passed);verification.acceptanceMatrix=evidence(matrixFile)}
 const blockers=[
  {id:'windows-installer-matrix',status:installerExecuted?'passed':'pending',detail:'Execute on a disposable authorized Windows runner; local fixtures are preparation evidence only.'},
- {id:'minimum-api-updated-engine',status:'pending',detail:'API26 native startup and old/missing-WebView guidance passed; full functionality with an updated engine on API26 is not yet verified.'},
- {id:'rc-three-day-trial',status:'pending',minimumElapsedMs:259200000},
- {id:'remaining-acceptance-combinations',status:'pending',detail:'See unchecked items in docs/V2.0_Lite_完整开发与验收计划.md.'}
+ {id:'windows-optimized-runtime',status:verification.windowsReleaseRuntime?.version===version&&verification.windowsReleaseRuntime?.passed===3?'passed':'pending'},
+ {id:'acceptance-matrix',status:matrixPassed?'passed':'pending',detail:'Sixteen scenarios mapped to executed unit tests and dated native/UI/cloud/device results.'}
 ];
 if(!sustainedStability||sustainedStability.phase!=='passed'||sustainedStability.elapsedMs<sustainedStability.requiredDurationMs)blockers.push({id:'actual-two-hour-workload',status:'pending'});
 const manifest={
@@ -101,33 +105,41 @@ const manifest={
  sourceFiles:sources.length,sourceManifestSha256:sha(sourceBytes),formalRelease:false,
  android:{minSdk:Number(androidProof.match(/sdkVersion:'(\d+)'/)[1]),targetSdk:Number(androidProof.match(/targetSdkVersion:'(\d+)'/)[1]),versionCode:Number(versionMatch[1]),versionName:version},
  androidSigning,windowsSigning:'No Authenticode signature',
- platformScope:{windowsDesktop:'Windows10 verified; Windows11 untested and explicitly excluded from this release acceptance by the user on 2026-10-24'},
+ platformScope:{windowsDesktop:'Windows10 verified; Windows11 untested and explicitly excluded from this release acceptance by the user on 2026-10-24',android:'Android14 physical HONOR70 and Android15/16 emulators verified; API26/Android8 is experimental compatibility with startup/update guidance only, as selected by the user on 2026-10-24'},
+ releasePolicy:{threeDayTrial:'User selected automatic acceptance before stable release on 2026-10-24; three-day daily use is post-release verification, not a release gate',windows11:'User explicitly waived this release test',android8:'User accepted experimental compatibility; full Android8 modern-engine functionality has not been verified'},
  toolchain:{node:process.version,rust:'1.97.1',jdk:'17.0.20.1',ndk:'29.0.13846066',gradle:'8.14.3'},
  recommendedInstallers:{android:`MOMENT-${version}-arm64-release.apk`,windows:`MOMENT-${version}-windows.msi`},
- cloudVerification:'Latest RC1 two-client contention and Windows-HONOR70 complete roundtrip passed. Actual production-lease expiry has earlier protocol evidence plus verified cleanup; exact evidence dates are retained.',
+ cloudVerification:'Current two-client contention and Windows-HONOR70 complete roundtrip use the visible handoff button. Actual production-lease expiry has earlier protocol evidence plus verified cleanup; exact evidence dates are retained.',
  phoneVerification:'Original phone app was upgraded using its test certificate and every original business JSON was verified. Separate project-certificate optimized QA app passed higher-version replacement and actual background delivery. Production-certificate emulator and optimized notification reboot evidence are recorded separately.',
  artifacts,verification,sustainedStability,releaseReadiness:blockers,
- documentation:'docs/V2.0_Lite_rc1_验收与发布说明.md'
+ documentation:'docs/V2.0_Lite_2.0.0_发布说明.md'
 };
 fs.writeFileSync(path.join(out,'manifest.json'),JSON.stringify(manifest,null,2));
 fs.writeFileSync(path.join(out,'SHA256SUMS.txt'),artifacts.map(x=>`${x.sha256}  ${x.file}`).join('\n')+'\n');
+if(process.argv.includes('--final')){
+ if(!/^\d+\.\d+\.\d+$/.test(version))throw Error('Stable release requires a stable application version');
+ if(blockers.some(x=>x.status!=='passed'))throw Error('Release acceptance gates remain unresolved');
+ execFileSync(process.execPath,[path.join(__dirname,'check-candidates.cjs'),'--require-soak'],{stdio:'inherit'});
+ manifest.formalRelease=true;
+ fs.writeFileSync(path.join(out,'manifest.json'),JSON.stringify(manifest,null,2));
+}
 fs.writeFileSync(path.join(out,'安装说明.txt'),[
- `此刻 MOMENT ${version} 发布候选版`,
+ `此刻 MOMENT ${version} ${manifest.formalRelease?'正式版':'定版验收中'}`,
  '',
- `Android 8及以上、ARM64：${manifest.recommendedInstallers.android}`,
- `Windows x64：${manifest.recommendedInstallers.windows}`,
+ `Android ARM64：${manifest.recommendedInstallers.android}（Android14真机、15/16模拟器已测；Android8为实验兼容）`,
+ `Windows10 x64：${manifest.recommendedInstallers.windows}（Windows11未实测）`,
  '安装前核对 SHA256SUMS.txt。Windows 包尚无 Authenticode 签名。',
  '',
  'Android 现有测试证书版本无法由项目正式证书直接覆盖。',
- '当前手机保留 RC1 Debug 及原数据；请先导出并验证加密备份，再安排正式证书迁移。',
+ '当前手机保留同版本 Debug 及原数据；请先导出并验证加密备份，再安排正式证书迁移。',
  '本次开发没有卸载手机原应用。不要为解决签名不一致直接清除应用数据。',
  'release-test-signed 为测试证书优化包；Debug、unsigned 和独立 QA 包不作为正式安装包。',
  '',
  `Android 项目证书 SHA-256：${androidSigning?.certificateSha256||'未验证'}`,
  `实际两小时测试：${sustainedStability?.phase||'无结果'}`,
  `尚待完成：${blockers.filter(x=>x.status==='pending').map(x=>x.id).join('、')||'无'}`,
- '当前 formalRelease:false。完整验收结果及限制见项目 docs/V2.0_Lite_rc1_验收与发布说明.md。',
+ `formalRelease:${manifest.formalRelease}。完整验收结果及限制见项目 ${manifest.documentation}。`,
  'manifest.json、sources.json 与原始证据记录可用于复核；私钥和用户数据不随安装包分发。',
  ''
 ].join('\r\n'),'utf8');
-console.log(JSON.stringify({version,sourceFiles:sources.length,artifacts:artifacts.map(x=>({file:x.file,bytes:x.bytes,sha256:x.sha256})),formalRelease:false,pending:blockers.filter(x=>x.status==='pending').map(x=>x.id)},null,2));
+console.log(JSON.stringify({version,sourceFiles:sources.length,artifacts:artifacts.map(x=>({file:x.file,bytes:x.bytes,sha256:x.sha256})),formalRelease:manifest.formalRelease,pending:blockers.filter(x=>x.status==='pending').map(x=>x.id)},null,2));

@@ -1,0 +1,44 @@
+name: Runtime probe
+on:
+  push:
+    branches: [codex/release-2-0-rc1]
+    paths:
+      - .tools/windows-release-runtime.cjs
+      - .tools/windows-release-runtime.ps1
+      - .tools/runtime-probe.ps1
+      - .github/workflows/runtime-probe.yml
+permissions:
+  contents: read
+  actions: read
+jobs:
+  runtime:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: '24.14.1'
+          package-manager-cache: false
+      - name: Inspect the exact previous optimized executable
+        env:
+          MOMENT_ALLOW_INSTALLER_QA: '1'
+          MOMENT_CI_TOKEN: ${{ github.token }}
+        run: ./.tools/runtime-probe.ps1
+      - name: Retain diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: runtime-probe-evidence
+          include-hidden-files: true
+          path: |
+            .build-cache/runtime-probe/provenance.json
+            .build-cache/windows-installer-evidence/*.json
+            .build-cache/windows-installer-evidence/*.log
+          retention-days: 7

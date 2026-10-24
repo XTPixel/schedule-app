@@ -1,10 +1,16 @@
 // Launch the real optimized EXE only on the explicitly authorized CI runner.
 const fs=require('node:fs'),path=require('node:path'),assert=require('node:assert/strict'),crypto=require('node:crypto');
-const{spawn}=require('node:child_process');const{Client}=require('./webview-qa-client.cjs');
+const{spawn,execFileSync}=require('node:child_process');const{Client}=require('./webview-qa-client.cjs');
 const root=path.resolve(__dirname,'..'),version=require('../package.json').version;
 assert.equal(process.env.GITHUB_ACTIONS,'true');assert.equal(process.env.RUNNER_OS,'Windows');assert.equal(process.env.MOMENT_ALLOW_INSTALLER_QA,'1');assert.equal(path.resolve(process.env.GITHUB_WORKSPACE),root);assert.match(root,/^D:\\/i);
 const out=path.join(root,'.build-cache/windows-installer-evidence'),exe=path.join(process.env.CARGO_TARGET_DIR,'release/schedule-app.exe'),results=[];
 const binarySha256=crypto.createHash('sha256').update(fs.readFileSync(exe)).digest('hex'),wait=ms=>new Promise(r=>setTimeout(r,ms));let client,child,task,lastStartupError,stderr='',endpointPages=[];
+let processDiagnostics;
+function inspectProcess(){
+ if(!child)return;
+ const command='$p=Get-Process -Id '+child.pid+' -ErrorAction SilentlyContinue | Select-Object Id,Responding,MainWindowTitle,MainWindowHandle,SessionId,PrivateMemorySize64; $children=Get-CimInstance Win32_Process -Filter "ParentProcessId = '+child.pid+'" | Select-Object Name,ProcessId,ParentProcessId,CommandLine; $wv=Get-ChildItem -LiteralPath (Join-Path ([Environment]::GetEnvironmentVariable("ProgramFiles(x86)")) "Microsoft/EdgeWebView/Application") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name; @{process=$p;children=@($children);webViewVersions=@($wv)} | ConvertTo-Json -Depth 5 -Compress';
+ try{processDiagnostics=JSON.parse(execFileSync('powershell.exe',['-NoProfile','-Command',command],{encoding:'utf8',timeout:15000}))}catch(e){processDiagnostics={inspectionError:String(e)}}
+}
 async function until(fn){for(let n=0;n<300;n++){try{if(await fn())return}catch(e){if(!/fetch failed|closed|Execution context was destroyed|undefined|owned application page required/.test(String(e)))throw e}await wait(200)}throw Error('CI Release window did not become ready; last error='+lastStartupError+'; exit='+child?.exitCode+'; stderr='+stderr)}
 async function start(){
  fs.mkdirSync(out,{recursive:true});
@@ -29,4 +35,4 @@ async function main(){
   await client.evaluate('[...document.querySelectorAll("nav button")].find(x=>x.innerText.includes("浮动")).click()');await until(()=>client.evaluate('document.querySelector("main").innerText.includes('+JSON.stringify(task.title)+')'));await client.invoke('delete_task',{id:task.id});assert.ok((await client.invoke('load_all_data')).tasks.find(x=>x.id===task.id)?.deletedAt);await close();
  });
 }
-main().catch(e=>{console.error(String(e));process.exitCode=1}).finally(async()=>{if(client){try{await close()}catch(e){console.error(String(e));process.exitCode=1}}if(child&&child.exitCode===null)child.kill();fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,'release-runtime.json'),JSON.stringify({recordedAt:new Date().toISOString(),version,sourceCommit:process.env.GITHUB_SHA,disposableCiOnly:true,binarySha256,diagnostics:{lastStartupError,processExit:child?.exitCode,stderr,endpointPages},results},null,2))});
+main().catch(e=>{inspectProcess();console.error(String(e));process.exitCode=1}).finally(async()=>{if(client){try{await close()}catch(e){console.error(String(e));process.exitCode=1}}if(child&&child.exitCode===null)child.kill();fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,'release-runtime.json'),JSON.stringify({recordedAt:new Date().toISOString(),version,sourceCommit:process.env.GITHUB_SHA,disposableCiOnly:true,binarySha256,diagnostics:{lastStartupError,processExit:child?.exitCode,stderr,endpointPages,processDiagnostics},results},null,2))});

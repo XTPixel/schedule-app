@@ -3,6 +3,7 @@
 const fs=require('node:fs'),path=require('node:path'),http=require('node:http'),crypto=require('node:crypto');
 const {spawn,execFileSync}=require('node:child_process');const assert=require('node:assert/strict');const {Client}=require('./webview-qa-client.cjs');
 const root=path.resolve(__dirname,'..'),out=path.join(root,'.build-cache','cloud-evidence');
+require('./cloud-qa-lock.cjs')(root);
 fs.mkdirSync(out,{recursive:true});
 const windowsOnly=process.env.MOMENT_WINDOWS_CLOUD_ONLY==='1';
 const serial=windowsOnly?null:require('./authorized-phone.cjs').authorizedPhone();
@@ -18,7 +19,12 @@ async function business(client){const data=await client.invoke('load_all_data');
 const shell=(...args)=>execFileSync(adb,['-s',serial,...args],{encoding:'utf8',timeout:30000});
 async function connect(port){for(let n=0;n<30;n++){try{return await Client.connect(port)}catch{await wait(500)}}throw Error('Application bridge not ready: '+port)}
 async function action(client,name,args={}){for(let n=0;n<180;n++){if((await client.invoke('sync_get_status')).syncing){await wait(500);continue}try{return await client.invoke(name,args)}catch(error){if(!String(error).includes('同步正在进行'))throw error}}throw Error('Application stayed busy for 90 seconds')}
-function forwardPhone(){const pid=shell('shell','pidof','com.personal.schedule').trim();assert.match(pid,/^\d+$/);shell('forward','tcp:9224','localabstract:webview_devtools_remote_'+pid)}
+function forwardPhone(){
+ assert.doesNotMatch(shell('shell','dumpsys','window','policy'),/mIsShowing=true|^\s+showing=true/m,'Unlock the authorized phone before visible cloud QA');
+ shell('shell','am','start','-W','-n','com.personal.schedule/.MomentLauncherActivity');
+ assert.ok(shell('shell','dumpsys','activity','activities').split('\n').some(x=>/mResumedActivity|topResumedActivity/.test(x)&&x.includes('com.personal.schedule/')),'The original phone application must be foreground; the separate QA app is not the cloud endpoint');
+ const pid=shell('shell','pidof','com.personal.schedule').trim();assert.match(pid,/^\d+$/);shell('forward','tcp:9224','localabstract:webview_devtools_remote_'+pid);
+}
 function canonical(value){return JSON.stringify(value,(_,v)=>v&&typeof v==='object'&&!Array.isArray(v)?Object.fromEntries(Object.keys(v).sort().map(k=>[k,v[k]])):v)}
 function phoneFiles(){
  const names=shell('shell','run-as','com.personal.schedule','ls').split(/\s+/),files=['config.json','events.json','routines.json','tasks.json','long_tasks.json','templates.json'].filter(n=>names.includes(n));
@@ -187,5 +193,5 @@ main().catch(error=>{console.error(String(error));process.exitCode=1}).finally(a
    }catch(error){console.error('Windows QA cleanup needs review: '+String(error));process.exitCode=1}
  }
  if(windows)windows.close();if(phone)phone.close();
- fs.writeFileSync(path.join(out,windowsOnly?'windows-probe.json':'roundtrip.json'),JSON.stringify({recordedAt:new Date().toISOString(),prefix,mode:windowsOnly?'Windows only':'Windows and HONOR70',phoneOriginalDataVerified:phoneRestored,results,remoteData:'QA-only; retained for review'},null,2));
+ fs.writeFileSync(path.join(out,windowsOnly?'windows-probe.json':'roundtrip.json'),JSON.stringify({recordedAt:new Date().toISOString(),version:require('../package.json').version,windowsBinarySha256:crypto.createHash('sha256').update(fs.readFileSync(exe)).digest('hex'),handoff:'Visible settings button on both platforms',prefix,mode:windowsOnly?'Windows only':'Windows and HONOR70',phoneOriginalDataVerified:phoneRestored,results,remoteData:'QA-only; retained for review'},null,2));
 });

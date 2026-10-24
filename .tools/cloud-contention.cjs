@@ -2,15 +2,17 @@
 const fs=require('node:fs'),path=require('node:path'),http=require('node:http'),crypto=require('node:crypto'),assert=require('node:assert/strict');
 const{spawn}=require('node:child_process');const{Client}=require('./webview-qa-client.cjs');
 const root=path.resolve(__dirname,'..'),base=path.join(root,'.build-cache/windows-evidence'),out=path.join(root,'.build-cache/cloud-evidence');
+require('./cloud-qa-lock.cjs')(root);
 const prefix=process.env.MOMENT_CLOUD_QA_PREFIX;assert.equal(prefix,'moment-qa/20261024-beta2-d43f80a3');
 const exe=path.join(process.env.CARGO_TARGET_DIR,'debug/schedule-app.exe'),helper=path.join(process.env.CARGO_TARGET_DIR,'debug/examples/cloud_qa_credentials.exe');
 const wait=ms=>new Promise(r=>setTimeout(r,ms)),results=[];
 const expiryMode=process.env.MOMENT_CLOUD_QA_EXPIRY==='1';let cancelRequested=false;
 if(expiryMode){process.stdin.setEncoding('utf8');process.stdin.on('data',value=>{if(value.includes('cancel'))cancelRequested=true});process.on('SIGINT',()=>{cancelRequested=true})}
-const qaPortBase=Number(process.env.MOMENT_CLOUD_QA_PORT_BASE||9225);assert.ok([9225,9228].includes(qaPortBase));
+const qaPortBase=Number(process.env.MOMENT_CLOUD_QA_PORT_BASE||9228);assert.equal(qaPortBase,9228,'Competition ports must not overlap the roundtrip or endurance test');
 const clients=[{port:qaPortBase,dir:path.join(base,'data'),name:'QA Windows A'},{port:qaPortBase+1,dir:path.join(base,'contender-data'),name:'QA Windows B'}];
 async function connect(port){for(let n=0;n<40;n++){try{return await Client.connect(port)}catch{await wait(250)}}throw Error('QA bridge not ready: '+port)}
 async function start(entry){
+ try{await fetch('http://127.0.0.1:'+entry.port+'/json/list');throw Error('Competition QA port is occupied')}catch(e){if(/occupied/.test(String(e)))throw e}
  fs.mkdirSync(entry.dir,{recursive:true});const marker=path.join(entry.dir,'.moment-qa-root');
  if(!fs.existsSync(marker))fs.writeFileSync(marker,'moment-isolated-test-data-v1');assert.equal(fs.readFileSync(marker,'utf8'),'moment-isolated-test-data-v1');
  const profile=path.join(base,'webview-'+entry.port),local=path.join(base,'local-'+entry.port);
@@ -25,7 +27,7 @@ async function start(entry){
  for(let n=0;n<40;n++){try{await entry.client.invoke('load_all_data');break}catch{await wait(100)}}
 }
 async function action(entry,name,args={}){let networkRetries=0;for(let n=0;n<180;n++){if((await entry.client.invoke('sync_get_status')).syncing){await wait(250);continue}try{return await entry.client.invoke(name,args)}catch(error){const text=String(error);if(text.includes('同步正在进行'))continue;if(/网络连接失败|七牛上传失败|同步提交发生竞争或网络失败/.test(text)&&networkRetries<3){await wait(1000*2**networkRetries++);continue}throw error}}throw Error('QA remained busy')}
-async function exit(entry){try{await action(entry,'sync_exit')}catch(error){if(!/closed/.test(String(error)))throw error}entry.client.close();entry.client=null;await wait(400)}
+async function exit(entry){try{await action(entry,'sync_exit')}catch(error){if(!/closed/.test(String(error)))throw error}entry.client.close();entry.client=null;for(let n=0;n<100;n++){if(entry.child.exitCode!==null)return;await wait(100)}throw Error('Owned competition process did not exit')}
 async function check(name,work){const start=Date.now();try{await work();results.push({name,passed:true,ms:Date.now()-start});console.log('PASS '+name)}catch(error){results.push({name,passed:false,error:String(error)});throw error}}
 async function bootstrap(){
  const token=crypto.randomBytes(32).toString('hex');let configured=false;
@@ -99,6 +101,6 @@ async function main(){
 function entryAlive(entry){return entry.child&&entry.child.exitCode===null&&entry.child.signalCode===null}
 main().catch(error=>{console.error(String(error));process.exitCode=1}).finally(async()=>{
  for(const entry of clients){if(!entry.prepared){if(entry.client)entry.client.close();continue}try{if(!entry.client)await start(entry);if((await entry.client.invoke('sync_get_status')).configured)await action(entry,'sync_disconnect');const empty=path.join(base,'contention-empty-'+entry.port);fs.mkdirSync(empty,{recursive:true});fs.writeFileSync(path.join(empty,'config.json'),JSON.stringify(entry.originalConfig));await action(entry,'import_data',{srcDir:empty});assert.equal((await entry.client.invoke('load_all_data')).tasks.length,0);await exit(entry)}catch(error){console.error('QA cleanup requires review for port '+entry.port+': '+String(error));process.exitCode=1;if(entry.client)entry.client.close()}}
- fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,expiryMode?'windows-expiry.json':'windows-contention.json'),JSON.stringify({recordedAt:new Date().toISOString(),prefix,platform:'two isolated Windows QA instances',realProductionLeaseExpiry:expiryMode,results,remoteData:'Synthetic QA only; retained for review'},null,2));
+ fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,expiryMode?'windows-expiry.json':'windows-contention.json'),JSON.stringify({recordedAt:new Date().toISOString(),version:require('../package.json').version,windowsBinarySha256:crypto.createHash('sha256').update(fs.readFileSync(exe)).digest('hex'),prefix,platform:'two isolated Windows QA instances',realProductionLeaseExpiry:expiryMode,results,remoteData:'Synthetic QA only; retained for review'},null,2));
  if(expiryMode)process.stdin.pause();
 });

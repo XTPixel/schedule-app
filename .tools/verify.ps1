@@ -22,6 +22,12 @@ try {
         $momentPassed=[regex]::Matches(($momentRustOutput -join "`n"),'test result: ok\. (\d+) passed; 0 failed;')
         if($momentPassed.Count -ne 1){throw "Cannot verify Rust result count: $momentPackage"}
         $momentRustCounts[$momentPackage]=[int]$momentPassed[0].Groups[1].Value
+        if ($momentPackage -eq 'schedule-app') {
+            $momentListArguments=@($momentTestArguments)+@('--','--list')
+            $momentInventory=& cargo @momentListArguments 2>&1
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate the executed application test binary' }
+            $momentInventory | Set-Content -LiteralPath (Join-Path $momentReports 'app-test-inventory.txt') -Encoding utf8
+        }
     }
     foreach ($momentScript in Get-ChildItem -LiteralPath $PSScriptRoot -File -Filter '*.cjs') {
         & node --check $momentScript.FullName

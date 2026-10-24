@@ -9,7 +9,24 @@ $momentQaProject=Join-Path $momentQaRoot ('projects/'+$momentVersion+'-'+[Guid]:
 $momentQaOutput=Join-Path $momentQaRoot ('releases/'+$momentVersion)
 $momentLibrary=Join-Path $env:CARGO_TARGET_DIR 'aarch64-linux-android/release/libschedule_app_lib.so'
 if(-not(Test-Path -LiteralPath $momentLibrary)){throw 'Build the arm64 Release library first'}
-if([Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($momentLibrary)).IndexOf($momentVersion,[StringComparison]::Ordinal) -lt 0){throw 'Release library does not contain the requested application version'}
+# Stable semver is compiled as numeric fields; searching stripped ELF bytes for
+# its display string is not a valid provenance check. Bind to the production
+# APK's manifest and exact packaged native library instead.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$momentProductionApk=Join-Path $momentProjectRoot 'src-tauri/gen/android/app/build/outputs/apk/arm64/release/app-arm64-release-unsigned.apk'
+Copy-Item -LiteralPath $momentProductionApk -Destination (Join-Path $momentCacheRoot 'android-phone-qa-production.apk') -Force
+$momentProductionBadging=& (Join-Path $env:ANDROID_HOME 'build-tools/36.0.0/aapt.exe') dump badging (Join-Path $momentCacheRoot 'android-phone-qa-production.apk')
+if($LASTEXITCODE -ne 0 -or ($momentProductionBadging -join "`n") -notmatch ([regex]::Escape("versionName='$momentVersion'"))){throw 'Production APK version mismatch'}
+$momentProductionZip=[IO.Compression.ZipFile]::OpenRead($momentProductionApk)
+try {
+    $momentProductionEntry=$momentProductionZip.GetEntry('lib/arm64-v8a/libschedule_app_lib.so')
+    if(-not $momentProductionEntry){throw 'Production APK native library missing'}
+    $momentNativeHash=[Security.Cryptography.SHA256]::Create()
+    $momentProductionStream=$momentProductionEntry.Open()
+    try{$momentPackagedHash=[BitConverter]::ToString($momentNativeHash.ComputeHash($momentProductionStream)).Replace('-','').ToLowerInvariant()}
+    finally{$momentProductionStream.Dispose();$momentNativeHash.Dispose()}
+    if($momentPackagedHash -ne (Get-FileHash -LiteralPath $momentLibrary -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'QA native library differs from the production APK'}
+} finally {$momentProductionZip.Dispose()}
 New-Item -ItemType Directory -Force -Path $momentQaProject,$momentQaOutput | Out-Null
 & robocopy.exe (Join-Path $momentProjectRoot 'src-tauri/gen/android') $momentQaProject /E /NFL /NDL /NJH /NJS /NP /XD build .gradle .tauri .idea .cxx /XF local.properties key.properties keystore.properties '*.jks' '*.keystore' *> (Join-Path $momentQaOutput 'source-copy.log')
 if($LASTEXITCODE -ge 8){throw 'QA Android source copy failed'}

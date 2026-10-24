@@ -14,7 +14,10 @@ const artifact=suffix=>{const items=manifest.artifacts.filter(x=>x.file.endsWith
 const sumLines=fs.readFileSync(path.join(out,'SHA256SUMS.txt'),'utf8').trim().split(/\r?\n/);
 assert.deepEqual(sumLines,manifest.artifacts.map(x=>`${x.sha256}  ${x.file}`));
 assert.equal(manifest.androidSigning.portableBackupVerified,true);
-assert.deepEqual(manifest.android,{minSdk:26,targetSdk:36,versionCode:200000050,versionName:version});
+const semver=version.match(/^(\d+)\.(\d+)\.(\d+)(?:-(beta|rc)\.(\d+))?$/);assert.ok(semver);
+const candidate=semver[4]?Number(semver[5])+(semver[4]==='rc'?49:0):99;
+const expectedCode=(Number(semver[1])*1000000+Number(semver[2])*1000+Number(semver[3]))*100+candidate;
+assert.deepEqual(manifest.android,{minSdk:26,targetSdk:36,versionCode:expectedCode,versionName:version});
 assert.equal(manifest.recommendedInstallers.android,artifact('-arm64-release.apk').file);
 assert.equal(manifest.recommendedInstallers.windows,artifact('-windows.msi').file);
 const results=[];
