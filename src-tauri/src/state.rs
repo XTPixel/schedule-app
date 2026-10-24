@@ -1,12 +1,17 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use schedule_core::{Config, Storage};
 
 /// 全局共享状态。
 pub struct AppState {
+    #[cfg(target_os = "android")]
+    pub mobile_schedule_fingerprint: Mutex<String>,
+    pub sync_gate: Mutex<()>,
+    pub sync_control: Arc<crate::sync::SyncControl>,
+    pub recovery_error: Mutex<Option<String>>,
     pub storage: Mutex<Storage>,
     /// 配置缓存（托盘最小化、通知开关、全局快捷键等行为依赖它）。
     pub config: Mutex<Config>,

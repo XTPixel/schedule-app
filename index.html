@@ -4,9 +4,18 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>此刻 · MOMENT</title>
+    <link rel="stylesheet" href="/boot-compat.css" />
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <section class="boot-fallback" aria-live="polite">
+        <h1>此刻 MOMENT</h1>
+        <p id="boot-message">正在启动…</p>
+        <p id="boot-help"></p>
+        <button id="boot-retry" type="button" hidden>重新检查</button>
+      </section>
+    </div>
+    <script src="/boot-compat.js"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

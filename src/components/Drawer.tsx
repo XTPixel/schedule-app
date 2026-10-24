@@ -232,7 +232,7 @@ export function Drawer() {
   }
 
   return (
-    <div className="fixed inset-y-0 right-0 z-40 flex w-[480px] flex-col border-l border-gray-200 dark:border-slate-600 bg-white dark:bg-slate-800 shadow-2xl">
+    <div className="fixed inset-y-0 right-0 z-40 flex w-full max-w-[480px] flex-col border-l border-gray-200 dark:border-slate-600 bg-white dark:bg-slate-800 shadow-2xl">
       <div className="flex h-14 items-center justify-between border-b border-gray-100 dark:border-slate-700 px-5">
         <div className="text-sm font-semibold text-gray-800 dark:text-slate-100">
           {isNew ? `新建${KIND_LABEL[kind]}` : `编辑${KIND_LABEL[kind]}`}

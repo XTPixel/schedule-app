@@ -1,3 +1,4 @@
+import { canEdit } from "../lib/editing";
 // 全局状态：数据 + UI（页面/抽屉/Toast/危险确认），封装全部 IPC 调用。
 import { create } from "zustand";
 import * as api from "../api/ipc";
@@ -280,6 +281,7 @@ interface AppStore {
   startTimer: (sourceType: CandidateSource, sourceId: string, title: string) => void;
   toggleTimer: (sourceType: CandidateSource, sourceId: string, title: string) => void;
   pauseTimer: (sourceId: string) => void;
+  checkpointTimers: () => void;
   timerElapsedMs: (sourceId: string) => number;
   /** V1.2：长期任务计时（单计时器互斥；写入 sessionStartedAt）。 */
   startLongTaskTimer: (task: LongTask) => void;
@@ -352,13 +354,16 @@ function setError(msg: string) {
 
 // 初始持久化状态（localStorage 当日有效；跨日由 key 带日期自然失效）。
 const _initTimers = loadJSON<Record<string, TimerState>>(TIMER_KEY, {});
+let _restoredRunningTimer = false;
 for (const t of Object.values(_initTimers)) {
   // 重启后恢复为「暂停」态，保留累计时长（不把关闭期间的时长误算进去）。
   if (t.running) {
     t.running = false;
     t.startedAt = 0;
+    _restoredRunningTimer = true;
   }
 }
+if (_restoredRunningTimer) saveJSON(TIMER_KEY, _initTimers);
 const _initSkipped = new Set(loadJSON<string[]>(skKey(localDateKey()), []));
 // V3.1 T11：稍后集合改为单一 key（含 day 字段），跨零点到期的条目不丢失。
 const _initSnoozed = loadJSON<Record<string, SnoozeEntry>>(SN_KEY, {});
@@ -594,7 +599,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
       }
     }
     const mergedDraft = { ...freshClone, ...localDirty, sessions: freshClone.sessions };
-    const mergedInitial = { ...freshClone, ...localDirty, sessions: freshClone.sessions };
+    // The baseline must reflect persisted data. Merging local edits into it
+    // would make an unsaved draft look clean after a session operation.
+    const mergedInitial = freshClone;
     set({
       drawer: {
         ...drawer,
@@ -630,6 +637,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   // ---- V3.0 F1：计时器 ----
 
   startTimer(sourceType, sourceId, title) {
+    if (!canEdit()) { get().pushToast("当前为只读状态，请先同步并获取编辑权"); return; }
     const now = Date.now();
     const timers = { ...get().timers };
     // 单计时器：开始新事项前，先暂停其它 running 计时。
@@ -657,6 +665,25 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
+  checkpointTimers() {
+    const now = Date.now();
+    const timers = { ...get().timers };
+    let changed = false;
+    for (const [id, timer] of Object.entries(timers)) {
+      if (!timer.running) continue;
+      timers[id] = {
+        ...timer,
+        accumulatedMs: timer.accumulatedMs + Math.max(0, now - timer.startedAt),
+        startedAt: now,
+      };
+      changed = true;
+    }
+    if (changed) {
+      set({ timers });
+      saveJSON(TIMER_KEY, timers);
+    }
+  },
+
   pauseTimer(sourceId) {
     const timers = { ...get().timers };
     const t = timers[sourceId];
@@ -676,6 +703,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   // ---- V1.2：长期任务计时 / 会话 ----
 
   startLongTaskTimer(task) {
+    if (!canEdit()) { get().pushToast("当前为只读状态，请先同步并获取编辑权"); return; }
     const now = Date.now();
     const timers = { ...get().timers };
     // 单计时器互斥：暂停其它 running 计时。

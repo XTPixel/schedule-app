@@ -151,6 +151,35 @@ export interface Config {
   dataDir: string;
 }
 
+// ---- V2.0 Lite：七牛单设备快照同步 ----
+
+export interface SyncConfigInput {
+  bucket: string;
+  downloadDomain: string;
+  prefix: string;
+  deviceName: string;
+  accessKey: string;
+  secretKey: string;
+  passphrase: string;
+}
+
+export interface SyncStatus {
+  syncing: boolean;
+  retryAt: string | null;
+  editable: boolean;
+  configured: boolean;
+  deviceId: string | null;
+  deviceName: string | null;
+  revision: number;
+  dirty: boolean;
+  lastSyncAt: string | null;
+  lastError: string | null;
+  lockedBy: string | null;
+  needsInitialChoice: boolean;
+}
+
+export type InitialSyncChoice = "upload" | "download" | "cancel";
+
 // ---- Phase 3（V2.0）新增类型 ----
 // （V3.1 新增 Config.tagColors / ReminderNotice.dedupKey / TagInfo.color）
 

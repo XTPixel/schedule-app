@@ -1,4 +1,5 @@
 import { useAppStore, type Page } from "../store/useAppStore";
+import { version } from "../../package.json";
 
 const NAV: { key: Page; label: string; icon: string }[] = [
   { key: "now", label: "现在", icon: "◉" },
@@ -15,12 +16,21 @@ const NAV: { key: Page; label: string; icon: string }[] = [
 ];
 
 /** 导航侧栏（§7.2 信息架构，v1.1.0 功能全景）。 */
-export function Sidebar() {
+export function Sidebar({ mobileOpen, onClose }: { mobileOpen: boolean; onClose: () => void }) {
   const page = useAppStore((s) => s.page);
   const setPage = useAppStore((s) => s.setPage);
 
   return (
-    <aside className="flex w-44 shrink-0 flex-col border-r border-gray-200 dark:border-slate-600 bg-white dark:bg-slate-800">
+    <>
+      {mobileOpen && (
+        <button
+          type="button"
+          aria-label="关闭导航"
+          className="fixed inset-0 z-30 bg-slate-950/40 md:hidden"
+          onClick={onClose}
+        />
+      )}
+      <aside className={`fixed inset-y-0 left-0 z-40 flex w-64 shrink-0 flex-col border-r border-gray-200 bg-white transition-transform dark:border-slate-600 dark:bg-slate-800 md:static md:w-44 md:translate-x-0 ${mobileOpen ? "translate-x-0" : "-translate-x-full"}`}>
       <div className="flex h-14 items-center gap-2 px-4 text-sm font-semibold text-gray-800 dark:text-slate-100">
         <span
           className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md"
@@ -35,13 +45,21 @@ export function Sidebar() {
           </svg>
         </span>
         此刻 MOMENT
+        <button
+          type="button"
+          aria-label="关闭导航"
+          className="ml-auto rounded-md px-2 py-1 text-lg text-gray-500 hover:bg-gray-100 dark:text-slate-300 dark:hover:bg-slate-700 md:hidden"
+          onClick={onClose}
+        >
+          ×
+        </button>
       </div>
       <nav className="flex flex-1 flex-col gap-1 px-2">
         {NAV.map((n) => (
           <button
             key={n.key}
             type="button"
-            onClick={() => setPage(n.key)}
+            onClick={() => { setPage(n.key); onClose(); }}
             className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition ${
               page === n.key
                 ? "bg-accent-50 dark:bg-accent-900/30 font-medium text-accent-700 dark:text-accent-200"
@@ -53,7 +71,8 @@ export function Sidebar() {
           </button>
         ))}
       </nav>
-      <div className="px-4 py-3 text-xs text-gray-400 dark:text-slate-500">v1.2.2</div>
-    </aside>
+      <div className="px-4 py-3 text-xs text-gray-400 dark:text-slate-500">v{version.replace("-", " ")}</div>
+      </aside>
+    </>
   );
 }

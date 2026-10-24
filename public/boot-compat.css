@@ -1,0 +1,4 @@
+.boot-fallback { box-sizing: border-box; max-width: 40rem; margin: 12vh auto; padding: 1.5rem; font: 16px/1.7 system-ui, sans-serif; color: #1f2937; }
+.boot-fallback h1 { font-size: 1.5rem; }
+.boot-fallback button { padding: .6rem 1rem; border: 1px solid #cbd5e1; border-radius: .5rem; background: #fff; color: #1f2937; font: inherit; }
+@media (prefers-color-scheme: dark) { .boot-fallback { color: #e2e8f0; background: #0f172a; border-radius: .75rem; } }

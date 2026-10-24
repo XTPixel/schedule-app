@@ -7,8 +7,10 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use std::{any::Any, sync::Arc};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -29,10 +31,16 @@ pub enum MtimeStatus {
 
 pub struct Storage {
     dir: PathBuf,
-    /// 每个文件最近一次读取/写入时记录的磁盘 mtime。
+    /// 初次读取、明确重载或本应用成功写入后认可的磁盘 mtime。
     mtimes: HashMap<String, Option<SystemTime>>,
     /// V3.1：检测到外部修改后，前端选择「覆盖」时置 true；下一次成功写入后自动复位。
     force_overwrite: bool,
+    cache: HashMap<String, CachedFile>,
+}
+struct CachedFile {
+    modified: SystemTime,
+    bytes: u64,
+    value: Arc<dyn Any + Send + Sync>,
 }
 
 impl Storage {
@@ -41,6 +49,7 @@ impl Storage {
             dir,
             mtimes: HashMap::new(),
             force_overwrite: false,
+            cache: HashMap::new(),
         }
     }
 
@@ -48,10 +57,17 @@ impl Storage {
         &self.dir
     }
 
-    /// V3.1：外部修改冲突的用户选择（`reload` 由读取自动重建 mtime 基线，
-    /// `overwrite` 允许下一次写入覆盖外部改动）。
+    /// `overwrite` 允许下一次写入覆盖外部改动。
     pub fn set_force_overwrite(&mut self, force: bool) {
         self.force_overwrite = force;
+    }
+
+    /// Only an explicit reload may accept external file changes as a baseline.
+    /// Passive refreshes must not silently authorize overwriting an open draft.
+    pub fn accept_external_changes(&mut self) {
+        self.force_overwrite = false;
+        self.mtimes.clear();
+        self.cache.clear();
     }
 
     /// 确保数据目录、归档子目录与钩子目录存在。
@@ -75,13 +91,24 @@ impl Storage {
     // -----------------------------------------------------------------------
 
     /// 读取并校验单个 JSON 文件（版本校验 + 迁移骨架 + 损坏备份）。
-    fn read_json<T: DeserializeOwned>(&mut self, file: &str) -> AppResult<Option<T>> {
+    fn read_json<T: DeserializeOwned + Clone + Send + Sync + 'static>(&mut self, file: &str) -> AppResult<Option<T>> {
         let path = self.path(file);
         if !path.exists() {
-            self.mtimes.insert(Self::key(file), None);
+            self.cache.remove(file);
+            self.mtimes.entry(Self::key(file)).or_insert(None);
             return Ok(None);
         }
-        let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let metadata = fs::metadata(&path)?;
+        let mtime = metadata.modified().ok();
+        if let (Some(modified), Some(cached)) = (mtime, self.cache.get(file)) {
+            if cached.modified == modified && cached.bytes == metadata.len() {
+                if let Some(value) = cached.value.downcast_ref::<T>() {
+                    self.mtimes.entry(Self::key(file)).or_insert(mtime);
+                    return Ok(Some(value.clone()));
+                }
+            }
+        }
+        self.cache.remove(file);
         let raw = fs::read_to_string(&path)?;
         let value: Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
@@ -98,8 +125,20 @@ impl Storage {
         let migrated = self.migrate_if_needed(file, value)?;
         let parsed: T =
             serde_json::from_value(migrated).map_err(|e| AppError::Json(e.to_string()))?;
-        self.mtimes.insert(Self::key(file), mtime);
+        self.mtimes.entry(Self::key(file)).or_insert(mtime);
+        self.cache_value(file, &parsed);
         Ok(Some(parsed))
+    }
+    /// Bound cached serialized size to 8 MiB. External edits/deletions invalidate
+    /// the typed cache through both modification time and file length.
+    fn cache_value<T: Clone + Send + Sync + 'static>(&mut self, file: &str, value: &T) {
+        const LIMIT: u64 = 8 * 1024 * 1024;
+        let Ok(metadata) = fs::metadata(self.path(file)) else { return };
+        let Ok(modified) = metadata.modified() else { return };
+        self.cache.remove(file);
+        if metadata.len() > LIMIT { return; }
+        if self.cache.values().map(|c|c.bytes).sum::<u64>() + metadata.len() > LIMIT { self.cache.clear(); }
+        self.cache.insert(file.into(), CachedFile { modified, bytes: metadata.len(), value: Arc::new(value.clone()) });
     }
 
     /// 版本校验 + 迁移骨架（§5.7）。
@@ -121,11 +160,30 @@ impl Storage {
     }
 
     fn backup_corrupt(&self, file: &str) -> Option<String> {
-        let src = self.path(file);
-        // BUG-26：备份名精确到毫秒，避免同一秒内多次损坏加载互相覆盖。
-        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%3f");
-        let dst = self.path(&format!("{file}.corrupt-{ts}.bak"));
-        fs::copy(&src, &dst).ok().map(|_| dst.display().to_string())
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
+        self.backup_corrupt_at(file, &ts)
+    }
+
+    fn backup_corrupt_at(&self, file: &str, ts: &str) -> Option<String> {
+        let mut source = fs::File::open(self.path(file)).ok()?;
+        // A timestamp alone can collide within one millisecond or across
+        // processes. Reserve each destination atomically and never overwrite it.
+        for suffix in 0..1000 {
+            let ending = if suffix == 0 { String::new() } else { format!("-{suffix}") };
+            let dst = self.path(&format!("{file}.corrupt-{ts}{ending}.bak"));
+            let mut target = match fs::OpenOptions::new().write(true).create_new(true).open(&dst) {
+                Ok(target) => target,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return None,
+            };
+            if std::io::copy(&mut source, &mut target).and_then(|_| target.sync_all()).is_err() {
+                drop(target);
+                let _ = fs::remove_file(&dst);
+                return None;
+            }
+            return Some(dst.display().to_string());
+        }
+        None
     }
 
     // -----------------------------------------------------------------------
@@ -133,7 +191,10 @@ impl Storage {
     // -----------------------------------------------------------------------
 
     /// 原子写入：临时文件 + rename；写前复制 .bak 备份；mtime 外部修改检测。
-    fn write_json_atomic<T: Serialize>(&mut self, file: &str, value: &T) -> AppResult<MtimeStatus> {
+    fn write_json_atomic<T: Serialize + Clone + Send + Sync + 'static>(&mut self, file: &str, value: &T) -> AppResult<MtimeStatus> {
+        if self.dir.join(".sync-transaction.json").exists() {
+            return Err(AppError::InvalidInput("数据事务尚未恢复，请重新打开应用并完成恢复".into()));
+        }
         self.ensure()?;
         let path = self.path(file);
         let key = Self::key(file);
@@ -144,9 +205,8 @@ impl Storage {
         } else {
             None
         };
-        let known = self.mtimes.get(&key).copied().flatten();
-        let status = match (disk_mtime, known) {
-            (Some(d), Some(k)) if d != k => MtimeStatus::ExternalChange,
+        let status = match self.mtimes.get(&key) {
+            Some(known) if *known != disk_mtime => MtimeStatus::ExternalChange,
             _ => MtimeStatus::Ok,
         };
 
@@ -161,17 +221,26 @@ impl Storage {
         // 覆盖前备份上一份有效内容到 .bak（best-effort）。
         if path.exists() {
             let bak = self.path(&format!("{file}.bak"));
-            let _ = fs::copy(&path, &bak);
+            if fs::copy(&path, &bak).is_ok() {
+                if let Ok(backup) = fs::OpenOptions::new().write(true).open(&bak) {
+                    let _ = backup.sync_all();
+                }
+            }
         }
 
         let tmp = self.path(&format!("{file}.tmp"));
         let text = serde_json::to_string_pretty(value)?;
-        fs::write(&tmp, text)?;
+        {
+            let mut staged = fs::File::create(&tmp)?;
+            staged.write_all(text.as_bytes())?;
+            staged.sync_all()?;
+        }
         // 原子重命名（Windows 同卷 rename 为原子操作）。
         fs::rename(&tmp, &path)?;
 
         self.mtimes
             .insert(key, fs::metadata(&path).and_then(|m| m.modified()).ok());
+        self.cache_value(file, value);
         // 覆盖完成后复位，后续外部修改再次触发拦截。
         self.force_overwrite = false;
         Ok(status)
@@ -647,6 +716,72 @@ mod tests {
     use super::*;
     use std::thread::sleep;
     use std::time::Duration;
+    #[test]
+    fn corrupt_backups_never_replace_an_existing_backup_at_the_same_timestamp() {
+        let dir = tmp_dir("corrupt-backup-collision");
+        let storage = Storage::new(dir.clone());
+        let legacy = dir.join("events.json.corrupt-fixed.bak");
+        fs::write(&legacy, "existing backup").unwrap();
+        fs::write(dir.join("events.json"), "first corrupted version").unwrap();
+        let first = storage.backup_corrupt_at("events.json", "fixed").unwrap();
+        fs::write(dir.join("events.json"), "second corrupted version").unwrap();
+        let second = storage.backup_corrupt_at("events.json", "fixed").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(first).unwrap(), "first corrupted version");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second corrupted version");
+        assert_eq!(fs::read_to_string(legacy).unwrap(), "existing backup");
+        assert_eq!(fs::read_to_string(dir.join("events.json")).unwrap(), "second corrupted version");
+        assert!(dir.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_corrupt_backups_atomically_reserve_distinct_destinations() {
+        use std::sync::{Arc, Barrier};
+        let dir = tmp_dir("corrupt-backup-concurrent");
+        fs::write(dir.join("events.json"), "corrupted source").unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles:Vec<_> = (0..2).map(|_| {
+            let dir = dir.clone(); let barrier = barrier.clone();
+            std::thread::spawn(move || { barrier.wait(); Storage::new(dir).backup_corrupt_at("events.json", "fixed").unwrap() })
+        }).collect();
+        let backups:Vec<_> = handles.into_iter().map(|h|h.join().unwrap()).collect();
+        assert_ne!(backups[0], backups[1]);
+        for backup in backups { assert_eq!(fs::read_to_string(backup).unwrap(), "corrupted source"); }
+        assert!(dir.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn pending_transaction_blocks_writes_without_changing_live_data() {
+        let dir=tmp_dir("pending-transaction");let mut storage=Storage::new(dir.clone());
+        storage.save_events(&[new_ev()]).unwrap();
+        let before=fs::read(dir.join("events.json")).unwrap();
+        fs::write(dir.join(".sync-transaction.json"), b"unresolved").unwrap();
+        assert!(storage.save_events(&[]).is_err());
+        assert_eq!(fs::read(dir.join("events.json")).unwrap(),before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn typed_cache_detects_external_changes_corruption_and_deletion() {
+        let dir=tmp_dir("typed-cache-external");let mut storage=Storage::new(dir.clone());
+        storage.save_events(&[new_ev()]).unwrap();
+        let mut external=new_ev();external.title="external title with different length".into();
+        fs::write(dir.join("events.json"),serde_json::to_vec(&EventsFile {version:CURRENT_VERSION,events:vec![external.clone()]}).unwrap()).unwrap();
+        assert_eq!(storage.read_events().unwrap()[0].title,external.title);
+        fs::write(dir.join("events.json"),b"broken").unwrap();
+        assert!(storage.read_events().is_err());
+        fs::remove_file(dir.join("events.json")).unwrap();
+        assert!(storage.read_events().unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn typed_cache_returns_independent_values() {
+        let dir=tmp_dir("typed-cache-owned");let mut storage=Storage::new(dir.clone());
+        storage.save_events(&[new_ev()]).unwrap();
+        let mut copy=storage.read_events().unwrap();copy[0].title="unsaved mutation".into();
+        assert_eq!(storage.read_events().unwrap()[0].title,"t");
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -798,6 +933,37 @@ mod tests {
         assert!(storage.load_archive_range("2025-13", "2026-01").is_err());
     }
 
+    #[test]
+    fn passive_refresh_keeps_external_change_blocked_until_explicit_reload() {
+        let dir=tmp_dir("external-refresh");let mut storage=Storage::new(dir.clone());
+        let stale=new_ev();storage.save_events(&[stale.clone()]).unwrap();
+        sleep(Duration::from_millis(25));let mut external=stale.clone();external.title="externally changed title".into();
+        fs::write(dir.join("events.json"),serde_json::to_vec(&EventsFile{version:CURRENT_VERSION,events:vec![external.clone()]}).unwrap()).unwrap();
+        // Both a fresh read and the next typed-cache hit preserve the guard.
+        for _ in 0..2 {
+            assert_eq!(storage.read_events().unwrap()[0].title,external.title);
+            assert!(matches!(storage.save_events(&[stale.clone()]),Err(AppError::ExternalChange{..})));
+        }
+        storage.accept_external_changes();let mut current=storage.read_events().unwrap();current[0].title="edited after reload".into();
+        storage.save_events(&current).unwrap();assert_eq!(storage.read_events().unwrap()[0].title,current[0].title);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn externally_deleted_file_is_not_recreated_by_a_stale_write() {
+        let dir=tmp_dir("external-delete");let mut storage=Storage::new(dir.clone());storage.save_events(&[new_ev()]).unwrap();
+        fs::remove_file(dir.join("events.json")).unwrap();assert!(storage.read_events().unwrap().is_empty());
+        assert!(matches!(storage.save_events(&[new_ev()]),Err(AppError::ExternalChange{..})));assert!(!dir.join("events.json").exists());
+        storage.accept_external_changes();assert!(storage.read_events().unwrap().is_empty());storage.save_events(&[]).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn externally_created_file_is_not_overwritten_after_a_missing_file_was_read() {
+        let dir=tmp_dir("external-create");let mut storage=Storage::new(dir.clone());assert!(storage.read_events().unwrap().is_empty());
+        fs::write(dir.join("events.json"),serde_json::to_vec(&EventsFile{version:CURRENT_VERSION,events:vec![new_ev()]}).unwrap()).unwrap();
+        assert_eq!(storage.read_events().unwrap().len(),1);assert!(matches!(storage.save_events(&[]),Err(AppError::ExternalChange{..})));
+        storage.set_force_overwrite(true);storage.save_events(&[]).unwrap();assert!(storage.read_events().unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn test_external_change_rejected_then_force_overwrite() {
         let dir = tmp_dir("mtime");

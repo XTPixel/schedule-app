@@ -1,5 +1,11 @@
 // IPC 封装：前端只做 UI，所有业务/存储/候选计算通过 invoke 调用 Rust 后端。
 import { invoke } from "@tauri-apps/api/core";
+
+// Rust `()` arrives as JSON null, while conflict handling reserves null for a
+// cancelled edit. Normalize successful void IPC to JavaScript undefined.
+async function invokeVoid(command: string, args?: Record<string, unknown>): Promise<void> {
+  await invoke<void>(command, args);
+}
 import type {
   AppData,
   ArchiveDay,
@@ -26,6 +32,9 @@ import type {
   TemplateApplyResult,
   TemplateKind,
   TemplatePreview,
+  SyncConfigInput,
+  SyncStatus,
+  InitialSyncChoice,
 } from "../types";
 
 export const loadAllData = () => invoke<AppData>("load_all_data");
@@ -35,22 +44,22 @@ export const getNowCandidates = (now: string) =>
 
 export const saveEvent = (event: Event) => invoke<Event>("save_event", { event });
 
-export const deleteEvent = (id: string) => invoke<void>("delete_event", { id });
+export const deleteEvent = (id: string) => invokeVoid("delete_event", { id });
 
 export const saveRoutine = (routine: Routine) => invoke<Routine>("save_routine", { routine });
 
-export const deleteRoutine = (id: string) => invoke<void>("delete_routine", { id });
+export const deleteRoutine = (id: string) => invokeVoid("delete_routine", { id });
 
 export const saveTask = (task: Task) => invoke<Task>("save_task", { task });
 
-export const deleteTask = (id: string) => invoke<void>("delete_task", { id });
+export const deleteTask = (id: string) => invokeVoid("delete_task", { id });
 
 // ---- V1.2：长期任务与会话 ----
 
 export const saveLongTask = (task: LongTask) =>
   invoke<LongTask>("save_long_task", { task });
 
-export const deleteLongTask = (id: string) => invoke<void>("delete_long_task", { id });
+export const deleteLongTask = (id: string) => invokeVoid("delete_long_task", { id });
 
 export interface AddLongTaskSessionInput {
   taskId: string;
@@ -72,10 +81,10 @@ export const updateLongTaskSessionNote = (
 ) => invoke<LongTaskSession>("update_long_task_session_note", { input: { taskId, sessionId, note } });
 
 export const deleteLongTaskSession = (taskId: string, sessionId: string) =>
-  invoke<void>("delete_long_task_session", { input: { taskId, sessionId } });
+  invokeVoid("delete_long_task_session", { input: { taskId, sessionId } });
 
 export const undeleteLongTaskSession = (taskId: string, sessionId: string) =>
-  invoke<void>("undelete_long_task_session", { input: { taskId, sessionId } });
+  invokeVoid("undelete_long_task_session", { input: { taskId, sessionId } });
 
 export interface DeleteLongTaskArchiveDayResult {
   deletedSessionIds: string[];
@@ -87,7 +96,7 @@ export const deleteLongTaskArchiveDay = (taskId: string, date: string) =>
   });
 
 export const undeleteLongTaskArchiveDay = (taskId: string, date: string, sessionIds: string[]) =>
-  invoke<void>("undelete_long_task_archive_day", {
+  invokeVoid("undelete_long_task_archive_day", {
     input: { taskId, date, sessionIds },
   });
 
@@ -105,7 +114,7 @@ export const getConfig = () => invoke<Config>("get_config");
 export const setConfig = (config: Config) => invoke<Config>("set_config", { config });
 
 export const notify = (title: string, body: string) =>
-  invoke<void>("notify", { title, body });
+  invokeVoid("notify", { title, body });
 
 // ---- Phase 1 / Phase 2 ----
 
@@ -125,9 +134,9 @@ export const getReview = (from: string, to: string) =>
 export const listTags = () => invoke<TagInfo[]>("list_tags");
 
 export const renameTag = (oldName: string, newName: string) =>
-  invoke<void>("rename_tag", { old: oldName, new: newName });
+  invokeVoid("rename_tag", { old: oldName, new: newName });
 
-export const deleteTag = (tag: string) => invoke<void>("delete_tag", { tag });
+export const deleteTag = (tag: string) => invokeVoid("delete_tag", { tag });
 
 export const pickDirectory = () => invoke<string | null>("pick_directory");
 
@@ -149,7 +158,7 @@ export const makeTemplateDefault = (kind: TemplateKind) =>
 export const saveTemplate = (template: Template) =>
   invoke<Template>("save_template", { template });
 
-export const deleteTemplate = (id: string) => invoke<void>("delete_template", { id });
+export const deleteTemplate = (id: string) => invokeVoid("delete_template", { id });
 
 export const previewTemplate = (templateId: string, date: string) =>
   invoke<TemplatePreview>("preview_template_cmd", { templateId, date });
@@ -162,7 +171,32 @@ export const hooksStatus = () => invoke<HooksStatus>("hooks_status_cmd");
 export const runHookTest = (hook: string, payload: string) =>
   invoke<HookRunResult[]>("run_hook_test", { hook, payload });
 
-export const openDataDir = () => invoke<void>("open_data_dir");
+export const openDataDir = () => invokeVoid("open_data_dir");
+
+// ---- V2.0 Lite：七牛快照同步 ----
+export const syncGetStatus = () => invoke<SyncStatus>("sync_get_status");
+export const exportBackupDocument = (passphrase?: string) => invoke<boolean>("export_backup_document", { passphrase: passphrase ?? null });
+export const importBackupDocument = (passphrase?: string) => invoke<boolean>("import_backup_document", { passphrase: passphrase ?? null });
+export const recoveryPoints = () => invoke<string[]>("recovery_points");
+export const recoveryDetails = () => invoke<{id:string;createdAt:string;platform:string;schemaVersion:number;files:number;complete:boolean}[]>("recovery_details");
+export const exportSyncDiagnostics = () => invoke<boolean>("export_sync_diagnostics");
+export const restoreRecoveryPoint = (id: string) => invoke<void>("restore_recovery_point", { id });
+export const notificationPermission = (request = false) => invoke<string>("notification_permission", { request });
+export const notificationReminderStatus = () => invoke<{exact:boolean}>("notification_reminder_status");
+export const notificationOpenSettings = (exact = false) => invoke<void>("notification_open_settings", {exact});
+export const syncConfigure = (input: SyncConfigInput) =>
+  invoke<SyncStatus>("sync_configure", { input });
+export const syncTestConnection = () => invoke<SyncStatus>("sync_test_connection");
+export const syncNow = () => invoke<SyncStatus>("sync_now");
+export const syncTick = () => invoke<SyncStatus>("sync_tick");
+export const syncCancel = () => invoke<SyncStatus>("sync_cancel");
+export const recoveryStatus = () => invoke<{error:string|null;points:string[]}>("recovery_status");
+export const syncResolveInitial = (choice: InitialSyncChoice) =>
+  invoke<SyncStatus>("sync_resolve_initial", { input: { choice } });
+export const syncTakeoverExpired = () => invoke<SyncStatus>("sync_takeover_expired");
+export const syncDisconnect = () => invoke<void>("sync_disconnect");
+export const syncExit = () => invoke<void>("sync_exit");
+export const syncForceExit = () => invoke<void>("sync_force_exit");
 
 // ---- V3.1 ----
 

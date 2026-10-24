@@ -1,7 +1,7 @@
 [package]
 name = "schedule-app"
-version = "1.2.2"
-description = "此刻 MOMENT —— 个人日程管理（1.2.2：修复隔 N 天窗口显示与归档交互）"
+version = "2.0.0-rc.1"
+description = "此刻 MOMENT —— Windows 与 Android 个人日程管理"
 edition = "2021"
 
 [lib]
@@ -16,10 +16,23 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-notification = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
 schedule-core = { path = "core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
+qiniu-sdk = { version = "0.2.4", features = ["ureq", "credential", "http", "http-client", "upload", "upload-token"] }
+keyring = { version = "4.2", features = ["v1"] }
+argon2 = "0.5"
+aes-gcm = "0.10"
+rand = "0.8"
+zstd = "0.13"
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+url = "2"
+ureq = "2.9"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -29,3 +42,12 @@ windows = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+keyring = { version = "4.2", default-features = false, features = ["android-native-keyring-store"] }
+keyring-core = "1"
+android-native-keyring-store = "1"
+
+# Keep large JSON collections responsive in development and device QA builds.
+[profile.dev.package.schedule-core]
+opt-level = 2

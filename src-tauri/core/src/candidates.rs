@@ -111,7 +111,7 @@ const UPCOMING_SOON_MIN: i64 = 30;
 /// 无结束时间的事件，开始后多少小时内仍视为「进行中」。
 const NO_END_IN_PROGRESS_HOURS: i64 = 4;
 /// 提醒提前量（分钟）：事件开始提醒。
-const EVENT_START_NOTIFY_MIN: i64 = 15;
+pub(crate) const EVENT_START_NOTIFY_MIN: i64 = 15;
 /// V1.2.2：提醒偏移量安全上限（365 天）。超限值视为异常数据，按无提醒处理（BUG-02）。
 const MAX_REMINDER_OFFSET_MINUTES: i64 = 525_600;
 /// 次级候选数量（§8.4 默认 5）。
@@ -203,7 +203,7 @@ pub fn compute_candidates(
                 let ended = timeutil::local_to_utc(end_date, end, tz);
                 if now > ended {
                     let overdue = timeutil::minutes_between_utc(&ended, &now);
-                    if overdue <= grace_hours * 60 {
+                    if overdue <= grace_hours.saturating_mul(60) {
                         let score = 3000 + overdue.min(240) + prio_w(rt.priority);
                         candidates.push(Candidate {
                             source_type: CandidateSource::Routine,
@@ -499,7 +499,7 @@ fn event_sort_key(ev: &Event) -> (String, String) {
 // ---------------------------------------------------------------------------
 
 /// 当日已完成集合（用于过滤「已归档过的（当天）」）。
-fn collect_done_today(
+pub(crate) fn collect_done_today(
     archive: &ArchiveFile,
     today: &NaiveDate,
 ) -> std::collections::HashSet<(ArchiveSource, String)> {
@@ -550,7 +550,7 @@ fn cmp_last_done(a: Option<&DateTime<Utc>>, b: Option<&DateTime<Utc>>) -> std::c
 // 提醒（§4.5，MVP 被动刷新触发）
 // ---------------------------------------------------------------------------
 
-fn build_reminders(
+pub(crate) fn build_reminders(
     data: &AppData,
     now: &DateTime<Utc>,
     local: &timeutil::LocalNow,
@@ -650,53 +650,71 @@ fn build_reminders(
         }
     }
 
-    // 日常窗口开始/即将结束（v1.1.0：当日已完成的日常不再提醒）。
+    // Include the previous anchor for cross-midnight windows. Deduplication is
+    // anchored to the window date, rather than the time the scheduler runs.
     for rt in &data.routines {
         if !rt.enabled || rt.deleted_at.is_some() {
             continue;
         }
-        if done_today.contains(&(ArchiveSource::Routine, rt.id.clone())) {
-            continue;
-        }
         for w in &rt.time_windows {
-            if !time_window_matches_date(w, local.date) {
-                continue;
-            }
             let (Ok(start), Ok(end)) =
                 (timeutil::parse_hhmm(&w.start), timeutil::parse_hhmm(&w.end))
             else {
                 continue;
             };
-            let start_utc = timeutil::local_to_utc(local.date, start, tz);
-            // V1.2.2 BUG-10：跨午夜窗口的结束时刻属于次日。
-            let end_date = if end <= start {
-                local.date.succ_opt().unwrap_or(local.date)
-            } else {
-                local.date
-            };
-            let end_utc = timeutil::local_to_utc(end_date, end, tz);
-            let until_start = timeutil::minutes_between_utc(now, &start_utc);
-            let until_end = timeutil::minutes_between_utc(now, &end_utc);
-            if until_start >= 0 && until_start <= EVENT_START_NOTIFY_MIN {
-                out.push(ReminderNotice {
-                    kind: "routine_window".to_string(),
-                    title: "日常窗口开始".to_string(),
-                    body: format!("{}（{}）", rt.title, w.start),
-                    source_id: rt.id.clone(),
-                    dedup_key: format!("routine_window:{}:{}:start", rt.id, w.start),
-                    priority: rt.priority,
-                    should_notify: notify(rt.priority),
-                });
-            } else if until_end >= 0 && until_end <= EVENT_START_NOTIFY_MIN {
-                out.push(ReminderNotice {
-                    kind: "routine_window".to_string(),
-                    title: "日常窗口即将结束".to_string(),
-                    body: format!("{}（{} 结束）", rt.title, w.end),
-                    source_id: rt.id.clone(),
-                    dedup_key: format!("routine_window:{}:{}:end", rt.id, w.end),
-                    priority: rt.priority,
-                    should_notify: notify(rt.priority),
-                });
+            for anchor in std::iter::once(local.date).chain(local.date.pred_opt()) {
+                if anchor != local.date && end > start {
+                    continue;
+                }
+                if !time_window_matches_date(w, anchor) {
+                    continue;
+                }
+                let completed = if anchor == local.date {
+                    done_today.contains(&(ArchiveSource::Routine, rt.id.clone()))
+                } else {
+                    collect_done_today(&data.archive, &anchor)
+                        .contains(&(ArchiveSource::Routine, rt.id.clone()))
+                };
+                if completed {
+                    continue;
+                }
+                let end_date = if end <= start {
+                    anchor.succ_opt().unwrap_or(anchor)
+                } else {
+                    anchor
+                };
+                let start_utc = timeutil::local_to_utc(anchor, start, tz);
+                let end_utc = timeutil::local_to_utc(end_date, end, tz);
+                let until_start = timeutil::minutes_between_utc(now, &start_utc);
+                let until_end = timeutil::minutes_between_utc(now, &end_utc);
+                let boundary = if (0..=EVENT_START_NOTIFY_MIN).contains(&until_start) {
+                    Some((
+                        "start",
+                        "日常窗口开始",
+                        format!("{}（{}）", rt.title, w.start),
+                        &w.start,
+                    ))
+                } else if (0..=EVENT_START_NOTIFY_MIN).contains(&until_end) {
+                    Some((
+                        "end",
+                        "日常窗口即将结束",
+                        format!("{}（{} 结束）", rt.title, w.end),
+                        &w.end,
+                    ))
+                } else {
+                    None
+                };
+                if let Some((kind, title, body, time)) = boundary {
+                    out.push(ReminderNotice {
+                        kind: "routine_window".into(),
+                        title: title.into(),
+                        body,
+                        source_id: rt.id.clone(),
+                        dedup_key: format!("routine_window:{}:{}:{}:{}", rt.id, anchor, time, kind),
+                        priority: rt.priority,
+                        should_notify: notify(rt.priority),
+                    });
+                }
             }
         }
     }
@@ -886,8 +904,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "routine_window:r1:08:55:end",
-                "routine_window:r1:09:00:start"
+                "routine_window:r1:2025-01-15:08:55:end",
+                "routine_window:r1:2025-01-15:09:00:start"
             ]
         );
     }

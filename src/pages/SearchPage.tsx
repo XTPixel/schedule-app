@@ -30,6 +30,9 @@ export function SearchPage() {
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
+  const dateRangeError = dateFrom && dateTo && dateFrom > dateTo
+    ? "开始日期不能晚于结束日期"
+    : null;
 
   useEffect(() => {
     void loadTags();
@@ -37,6 +40,10 @@ export function SearchPage() {
   }, [loadTags, clearSearch]);
 
   function run() {
+    if (dateRangeError) {
+      clearSearch();
+      return;
+    }
     const q: SearchQuery = {
       text,
       tags: selectedTags,
@@ -87,9 +94,12 @@ export function SearchPage() {
             ))}
           </div>
         )}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <input
             type="date"
+            aria-label="开始日期"
+            aria-invalid={Boolean(dateRangeError)}
+            aria-describedby={dateRangeError ? "search-date-range-error" : undefined}
             className="rounded-lg border border-gray-200 dark:border-slate-600 bg-white dark:bg-slate-800 px-2 py-1.5 text-sm text-gray-800 dark:text-slate-100"
             value={dateFrom}
             onChange={(e) => setDateFrom(e.target.value)}
@@ -97,6 +107,9 @@ export function SearchPage() {
           <span className="text-gray-400 dark:text-slate-500">至</span>
           <input
             type="date"
+            aria-label="结束日期"
+            aria-invalid={Boolean(dateRangeError)}
+            aria-describedby={dateRangeError ? "search-date-range-error" : undefined}
             className="rounded-lg border border-gray-200 dark:border-slate-600 bg-white dark:bg-slate-800 px-2 py-1.5 text-sm text-gray-800 dark:text-slate-100"
             value={dateTo}
             onChange={(e) => setDateTo(e.target.value)}
@@ -118,6 +131,11 @@ export function SearchPage() {
             重置
           </button>
         </div>
+        {dateRangeError && (
+          <p id="search-date-range-error" role="alert" className="mt-2 text-sm text-red-600 dark:text-red-400">
+            {dateRangeError}
+          </p>
+        )}
       </div>
 
       {/* 结果 */}

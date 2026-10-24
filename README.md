@@ -5,13 +5,13 @@
 <h1 align="center">此刻 MOMENT</h1>
 
 <p align="center">
-  本地优先 · 数据自持 · 常驻托盘的 Windows 个人日程管理桌面应用<br/>
+  本地优先 · 数据自持 · Windows / Android 个人日程管理应用<br/>
   回答「此刻该做什么」：事件 / 日常 / 浮动事项 / 长期任务 + 五层候选推荐引擎 + 今日时间轴 + 系统级提醒
 </p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/版本-1.2.2-2563EB" />
-  <img alt="Platform" src="https://img.shields.io/badge/平台-Windows-0078D6" />
+  <img alt="Version" src="https://img.shields.io/badge/版本-2.0.0--rc.1-2563EB" />
+  <img alt="Platform" src="https://img.shields.io/badge/平台-Windows%20%2F%20Android-0078D6" />
   <img alt="Tauri" src="https://img.shields.io/badge/Tauri-2.x-FFC131" />
   <img alt="React" src="https://img.shields.io/badge/React-18-61DAFB" />
 </p>
@@ -20,9 +20,51 @@
 
 ## 项目简介
 
-**此刻 MOMENT** 是一款本地优先的个人日程管理桌面应用。所有数据保存在本机 JSON 文件中，不上传云端；应用常驻系统托盘，在事件开始、日常窗口开启与浮动事项截止前按优先级推送系统通知。
+**此刻 MOMENT** 是一款本地优先的个人日程管理应用。业务数据保存在本机 JSON 文件中；未配置同步时无需云端。用户可选用自己的七牛空间，上传经过压缩和加密的快照，在 Windows 和 Android 之间接续编辑。Windows 支持常驻托盘；Android 使用系统通知调度。
 
-它不是一个简单的待办清单，而是把「事件、日常、浮动事项、长期任务」四类数据与候选推荐引擎结合，直接告诉你现在最该做什么。
+当前工作版本为 **2.0.0-rc.1**，前端及101项Rust测试、Windows真实界面、Android最低版本引导、HONOR70项目证书升级和后台提醒均已有验收证据。手机原应用覆盖后保留RC1 Debug，原有业务数据指纹一致。正式签名ARM64 Release、Windows EXE/MSI及测试包位于D盘候选目录，SHA-256和签名以产物清单为准。完整范围见[开发计划](docs/V2.0_Lite_完整开发与验收计划.md)，本轮结果及未完成的发布门槛见[RC1验收与发布说明](docs/V2.0_Lite_rc1_验收与发布说明.md)；此前的真实云端往返等保留在[beta.2记录](docs/V2.0_Lite_beta2_验收与交付记录.md)。三天试用、Windows11及隔离安装矩阵等门槛完成前保持发布候选状态。
+
+### 本轮新增能力
+
+- 同步写入守卫、租约与基础版本校验；失去编辑授权后只读并暂停计时。
+- 协议 v2 使用不可覆盖的协调记录提交版本与租约，快照经 Argon2id + AES-256-GCM 加密。
+- 下载前完整校验、事务恢复、最近五个本地恢复点；恢复前保留当前副本。
+- 网络传输期间释放业务存储锁，generation 校验保护传输中的新修改；支持取消、超时和重试退避。
+- 凭据更新先暂存完整新配置；损坏事务进入恢复页面；可导出不含事项、凭据和原始错误的诊断。
+- 导入、模板应用和批量标签变更使用持久化事务；本地备份可选口令加密。
+- Android 原生文档导入导出、通知授权、小屏导航和键盘安全区域处理。
+- Android 提醒计划持久化、重启恢复、通知与精确定时设置入口；静音切换同步更新已排提醒。
+- 修复空返回值被误认为取消操作，事项/会话/模板删除后正常刷新并恢复适用的撤回入口。
+- 会话操作后保留未提交的长期任务草稿并维持放弃修改确认；搜索日期范围倒置时给出明确提示。
+- 活跃计时每十秒及生命周期边界保存，重启恢复暂停；被动刷新保留外部文件冲突基线，损坏文件备份避免重名覆盖。
+- 损坏的配置或业务文件也能进入本地恢复和文档导入；旧浏览组件和缺少浏览组件时提供启动引导。
+- Android 提醒预排未来 48 小时、最多 128 条，打开应用刷新，重启解锁后恢复已排提醒。设置页可检查通知与精确定时权限；系统省电和厂商后台策略仍可能延迟送达，强行停止后需要重新打开。后台同步在恢复前台时补做。
+
+### 同步和备份
+
+先导出本地备份，再在设置中填写独立七牛测试空间、HTTPS 下载域名和专用前缀（默认 `moment-sync/v2`）。使用权限受限的用户自备 AK/SK，凭据保存于系统凭据库；同步口令必须自行保管。首次两端都有数据时明确选择上传或下载。旧协议前缀会被拒绝，所有设备升级后应使用新前缀。
+
+设置中的文档备份可填写至少 8 个字符的独立口令，文件使用 Argon2id + AES-256-GCM 加密；留空导出明文 JSON。两种格式均不包含云端凭据；目录导出同样是明文。备份口令不保存，遗失后无法解密。本地恢复入口位于设置的数据管理区域，恢复前自动备份当前数据；启动发现损坏事务会先展示恢复页面。
+
+设备配置和正在运行的计时器保留在本机。退出前应停止计时并确认同步成功，再到另一台设备接续。不要把同一前缀用于多个互不相关的数据集。旧版客户端不支持协议 v2，升级全部设备后再配置新前缀；回退应用前先断开同步、导出备份，保留原目录并在独立目录恢复，禁止旧版直接写入新协议空间。
+
+### 本机 D 盘构建
+
+在项目根目录的 PowerShell 中执行：
+
+```powershell
+. ./.tools/build-env.ps1
+./.tools/start-emulator.ps1          # 使用 D 盘已有专用镜像启动，默认 3GB 内存
+npm run build
+./.tools/verify.ps1                  # 前端、Rust 和测试脚本校验
+./.tools/build-android.ps1 -Abi x86_64  # 模拟器
+./.tools/build-android.ps1 -Abi aarch64 # 后续真机测试包
+./.tools/build-android.ps1 -Abi aarch64 -Release # 未签名 Release 候选包
+```
+
+本机缓存、临时文件、Gradle、Rust 工具链和目标文件使用 D 盘。NDK 对中文路径的限制通过 `D:\moment-native-build` 处理；SDK/JDK 原有安装只作为工具读取。模拟器及镜像位于 `D:\moment-build\android-sdk`，AVD 位于同盘。Android 构建脚本可在原生库编译成功、系统禁止创建符号链接时复制原生库后继续打包，无需打开 Windows 开发者模式。
+
+它把事件、日常、浮动事项和长期任务与候选推荐引擎结合，帮助选择现在最适合处理的事项。
 
 ## 功能特性
 
@@ -78,14 +120,15 @@
 
 ### 环境要求
 
-- Windows 10 / 11（WebView2 一般随系统自带）
-- Node.js 18+ 与 npm
-- Rust stable（MSVC 工具链）
+- Windows 10 / 11及可用的现代WebView2运行时；本轮Windows10已测试，Windows11待实测
+- 已验证的构建工具链：Node.js 24.14.1、npm、Rust 1.97.1（MSVC）
 - Visual Studio Build Tools（含「使用 C++ 的桌面开发」组件）
+- Android最低API26，需可用且更新到现代版本的系统WebView；本轮使用JDK17、NDK29和target API36构建
 
 ### 开发模式
 
 ```powershell
+. ./.tools/build-env.ps1
 npm install
 npm run tauri dev
 ```
@@ -93,13 +136,20 @@ npm run tauri dev
 ### 生产构建
 
 ```powershell
-npm run tauri build
+. ./.tools/build-env.ps1
+./.tools/build-windows.ps1
 ```
 
 构建产物：
 
-- 安装包：`src-tauri/target/release/bundle/`
-- 主程序：`src-tauri/target/release/schedule-app.exe`
+- 安装包：`$env:CARGO_TARGET_DIR/release/bundle/`
+- 主程序：`$env:CARGO_TARGET_DIR/release/schedule-app.exe`
+
+本机为 `D:\moment-native-build\target`。Android Release 默认不附正式签名；Debug 或测试证书不能作为正式发布签名。所有升级包必须沿用相同签名证书，否则系统会拒绝覆盖安装；不要通过卸载来解决签名不匹配，以免丢失应用数据。
+
+Windows 构建脚本将应用语义版本映射为 MSI 可升级的三段数字版本（本轮应用 `2.0.0-rc.1`、MSI `2.0.50`；正式2.0.0使用MSI2.0.99）。不要直接把带预发布标记的版本传给 MSI 打包器。已完成原生构建时可用 `-BundleOnly` 仅重新打包。
+
+Gradle的 Android 签名从环境变量读取 `MOMENT_ANDROID_KEYSTORE`、`MOMENT_ANDROID_STORE_PASSWORD`、`MOMENT_ANDROID_KEY_ALIAS`、`MOMENT_ANDROID_KEY_PASSWORD`；四项必须完整配置。将口令放在本机安全环境或 CI secrets，不写进 Gradle、聊天或版本库；未配置时只生成未签名候选包。本机已用`.tools/android-signing.ps1`在D盘`.private/android-signing`建立项目证书，以当前用户DPAPI保护随机密码；交付脚本会用它签署独立的`arm64-release.apk`。私有目录不参与Git提交和缓存清理。本轮已按[交付记录](docs/V2.0_Lite_beta2_验收与交付记录.md)导出并验证由用户自选密码保护的可携带证书备份，离线副本由用户自行保管；现有Debug手机仍沿用测试签名。
 
 ### 构建验证
 
@@ -152,13 +202,15 @@ hooks/
 
 ## 安全提示
 
-- 应用默认只读写本机数据，不包含账号系统，也不会上传云端。
+- 未配置同步时仅使用本机数据；启用后会向用户配置的七牛空间发送加密业务快照。设备名称、时间和协调租约属于明文元数据。
+- 使用独立测试空间或专用前缀及受限凭据。凭据至少需要读取对应空间对象及创建对象的权限；同步依赖不可覆盖创建，不授予无关空间、账户管理或删除权限。具体授权范围在七牛侧核验后再用于真实数据。
 - 脚本钩子默认关闭；启用后会执行数据目录 `hooks/*.js`（受限解释器，无文件系统 / 网络能力，单脚本限时 2 秒），请仅放入信任的脚本。
 - 请勿让网盘 / Git 等工具在多端同时同步同一个数据目录，以免产生写入冲突。
 
 ## 版本
 
-- 当前应用版本：**1.2.1**
+- 后续开发与验收：[V2.0 Lite 完整开发计划](docs/V2.0_Lite_完整开发与验收计划.md)（Windows / Android 单设备互斥同步）。
+- 当前应用版本：**2.0.0-beta.2**（正式发布验收未完成）
 - 数据版本：`CURRENT_VERSION = 6`
 
 ## 许可证

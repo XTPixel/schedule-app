@@ -17,14 +17,23 @@ use schedule_core::{
     Template, TemplateApplyResult, TemplateKind, TemplatePreview,
 };
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_fs::FsExt;
 use tauri_plugin_notification::NotificationExt;
 
 use crate::state::AppState;
+use crate::sync::{InitialSyncChoiceInput, SyncConfigInput, SyncService, SyncStatus};
 
 fn lock_err() -> String {
     "存储锁获取失败".to_string()
+}
+
+fn sync_service(state: &AppState) -> SyncService {
+    SyncService::new(state.base_dir.clone()).with_runtime(
+        state.sync_control.clone(),
+        state.recovery_error.lock().ok().and_then(|e| e.clone()),
+    )
 }
 
 /// 钩子安全开关开启时，向数据目录 `hooks/*.js` 分发一次生命周期事件（只读入参，导出类场景）。
@@ -52,6 +61,56 @@ fn month_of(date: &str) -> String {
     date.split('-').take(2).collect::<Vec<_>>().join("-")
 }
 
+/// Validate semantic data before replacing any live snapshot file.
+pub(crate) fn validate_snapshot_data(data: &AppData) -> Result<(), String> {
+    fn unique<'a>(ids: impl Iterator<Item = &'a str>) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            if id.is_empty() || !seen.insert(id) {
+                return Err("备份包含空或重复事项 ID".into());
+            }
+        }
+        Ok(())
+    }
+    unique(data.events.iter().map(|x| x.id.as_str()))?;
+    unique(data.routines.iter().map(|x| x.id.as_str()))?;
+    unique(data.tasks.iter().map(|x| x.id.as_str()))?;
+    unique(data.long_tasks.iter().map(|x| x.id.as_str()))?;
+    for event in &data.events {
+        let start = normalize_absolute(&event.start, event.all_day)?;
+        if let Some(end) = event.end.as_ref() {
+            let end = normalize_absolute(end, event.all_day)?;
+            if (event.all_day && end < start) || (!event.all_day && end <= start) {
+                return Err("备份事件结束时间无效".into());
+            }
+        }
+    }
+    for routine in &data.routines {
+        validate_routine(routine)?;
+    }
+    for task in &data.tasks {
+        if let Some(deadline) = task.deadline.as_ref() {
+            timeutil::parse_utc(deadline).map_err(|e| e.to_string())?;
+        }
+    }
+    for task in &data.long_tasks {
+        validate_long_task(task)?;
+        unique(task.sessions.iter().map(|s| s.id.as_str()))?;
+        for session in &task.sessions {
+            let start = timeutil::parse_utc(&session.started_at).map_err(|e| e.to_string())?;
+            let end = timeutil::parse_utc(&session.ended_at).map_err(|e| e.to_string())?;
+            if end < start
+                || session.duration_ms < 0
+                || session.duration_ms > (end - start).num_milliseconds()
+                || session.duration_ms > 7 * 24 * 60 * 60 * 1000
+            {
+                return Err("备份长期任务会话时长无效".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `YYYY-MM` 且月份合法（BUG-27：拒绝路径穿越 / 垃圾月份参数）。
 fn is_valid_month(s: &str) -> bool {
     let mut parts = s.split('-');
@@ -72,11 +131,23 @@ fn is_valid_month(s: &str) -> bool {
 /// `load_all_data()`：加载并校验全部 JSON；随后幂等回填长期任务归档聚合条目。
 #[tauri::command]
 pub fn load_all_data(state: State<AppState>) -> Result<AppData, String> {
+    if let Some(error) = state
+        .recovery_error
+        .lock()
+        .map_err(|_| lock_err())?
+        .as_ref()
+    {
+        return Err(format!("需要恢复数据：{error}"));
+    }
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
     let mut data = storage.load_all().map_err(|e| e.to_string())?;
     // V1.2.1：升级前历史会话 / 归档缺漏回填（只补齐缺失，不覆盖已有条目）。
-    backfill_long_task_archives(&mut storage, &data)
+    if sync_service(&state).status().editable {
+        backfill_long_task_archives_guarded(&mut storage, &data, || {
+            sync_service(&state).prepare_write()
+        })
         .map_err(|e| format!("长期任务归档对账失败：{e}"))?;
+    }
     // 回填可能修改当前月份归档：重新加载一次，保证返回的 archive 与磁盘一致。
     data = storage.load_all().map_err(|e| e.to_string())?;
     if let Ok(mut cfg) = state.config.lock() {
@@ -87,22 +158,31 @@ pub fn load_all_data(state: State<AppState>) -> Result<AppData, String> {
 
 /// `get_now_candidates(now)`：返回候选（事件/日常/浮动事项）+ 今日时间轴 + 提醒。
 #[tauri::command]
-pub fn get_now_candidates(now: String, state: State<AppState>) -> Result<CandidatesResult, String> {
-    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-    let data = storage.load_all().map_err(|e| e.to_string())?;
-    let result = compute_candidates(&data, &now, &data.config).map_err(|e| e.to_string())?;
-    let hooks_enabled = state
-        .config
-        .lock()
-        .map(|c| c.hooks.enabled)
-        .unwrap_or(false);
-    dispatch_hook_if_enabled(
-        hooks_enabled,
-        storage.data_dir(),
-        "on_candidate_refresh",
-        &result,
-    );
-    Ok(result)
+pub async fn get_now_candidates(now: String, app: AppHandle) -> Result<CandidatesResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let (data, dir) = {
+            let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+            (
+                storage.load_all().map_err(|e| e.to_string())?,
+                storage.data_dir().to_path_buf(),
+            )
+        };
+        let result = compute_candidates(&data, &now, &data.config).map_err(|e| e.to_string())?;
+        #[cfg(target_os = "android")]
+        if let Err(error) = crate::mobile_reminders::refresh(&app) {
+            eprintln!("Android reminder plan: {error}");
+        }
+        dispatch_hook_if_enabled(
+            data.config.hooks.enabled,
+            &dir,
+            "on_candidate_refresh",
+            &result,
+        );
+        Ok(result)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +192,7 @@ pub fn get_now_candidates(now: String, state: State<AppState>) -> Result<Candida
 #[tauri::command]
 pub fn save_event(event: Event, state: State<AppState>) -> Result<Event, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut events = storage.read_events().map_err(|e| e.to_string())?;
     let mut ev = event;
     if ev.id.is_empty() {
@@ -168,6 +249,7 @@ pub fn save_event(event: Event, state: State<AppState>) -> Result<Event, String>
 #[tauri::command]
 pub fn delete_event(id: String, state: State<AppState>) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut events = storage.read_events().map_err(|e| e.to_string())?;
     let now = timeutil::now_utc_string();
     for e in events.iter_mut() {
@@ -234,6 +316,7 @@ pub fn save_routine(routine: Routine, state: State<AppState>) -> Result<Routine,
     validate_routine(&r)?;
 
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut routines = storage.read_routines().map_err(|e| e.to_string())?;
     if r.id.is_empty() {
         r.id = schedule_core::id::new_id("r");
@@ -256,6 +339,7 @@ pub fn save_routine(routine: Routine, state: State<AppState>) -> Result<Routine,
 #[tauri::command]
 pub fn delete_routine(id: String, state: State<AppState>) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut routines = storage.read_routines().map_err(|e| e.to_string())?;
     let now = timeutil::now_utc_string();
     for r in routines.iter_mut() {
@@ -277,6 +361,7 @@ pub fn delete_routine(id: String, state: State<AppState>) -> Result<(), String> 
 #[tauri::command]
 pub fn save_task(task: Task, state: State<AppState>) -> Result<Task, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut tasks = storage.read_tasks().map_err(|e| e.to_string())?;
     let mut t = task;
     if t.id.is_empty() {
@@ -301,6 +386,7 @@ pub fn save_task(task: Task, state: State<AppState>) -> Result<Task, String> {
 #[tauri::command]
 pub fn delete_task(id: String, state: State<AppState>) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut tasks = storage.read_tasks().map_err(|e| e.to_string())?;
     let now = timeutil::now_utc_string();
     for t in tasks.iter_mut() {
@@ -334,6 +420,7 @@ fn validate_long_task(t: &LongTask) -> Result<(), String> {
 pub fn save_long_task(task: LongTask, state: State<AppState>) -> Result<LongTask, String> {
     validate_long_task(&task)?;
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
     let mut t = task;
     if t.id.is_empty() {
@@ -364,6 +451,7 @@ pub fn save_long_task(task: LongTask, state: State<AppState>) -> Result<LongTask
 #[tauri::command]
 pub fn delete_long_task(id: String, state: State<AppState>) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
     let now = timeutil::now_utc_string();
     for t in tasks.iter_mut() {
@@ -501,7 +589,15 @@ fn sync_long_task_archive_day(
 }
 
 /// 启动 / 加载时幂等回填：只补齐缺失的 longtask 聚合条目，不覆盖已存在条目。
+#[cfg(test)]
 fn backfill_long_task_archives(storage: &mut Storage, data: &AppData) -> Result<usize, String> {
+    backfill_long_task_archives_guarded(storage, data, || Ok(()))
+}
+fn backfill_long_task_archives_guarded(
+    storage: &mut Storage,
+    data: &AppData,
+    before_write: impl Fn() -> Result<(), String>,
+) -> Result<usize, String> {
     let tz = &data.config.timezone;
     // (task index, task id, date) -> 该天全部有效会话。
     let mut grouped: BTreeMap<(usize, String, String), Vec<&LongTaskSession>> = BTreeMap::new();
@@ -540,6 +636,7 @@ fn backfill_long_task_archives(storage: &mut Storage, data: &AppData) -> Result<
         });
         if missing {
             if let Some(entry) = build_long_task_archive_entry(task, &sessions, tz, None)? {
+                before_write()?;
                 day.entries.push(entry);
                 day.entries.sort_by(|a, b| a.done_at.cmp(&b.done_at));
                 day.updated_at = timeutil::now_utc_string();
@@ -573,6 +670,7 @@ pub fn add_long_task_session(
     state: State<AppState>,
 ) -> Result<LongTaskSession, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let tz = config.timezone.clone();
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
@@ -647,6 +745,7 @@ pub fn update_long_task_session_note(
     state: State<AppState>,
 ) -> Result<LongTaskSession, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let tz = config.timezone.clone();
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
@@ -704,6 +803,7 @@ fn set_long_task_session_deleted(
     state: State<AppState>,
 ) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let tz = config.timezone.clone();
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
@@ -751,6 +851,7 @@ pub fn delete_long_task_archive_day(
     state: State<AppState>,
 ) -> Result<DeleteLongTaskArchiveDayResult, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let tz = config.timezone.clone();
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
@@ -793,6 +894,7 @@ pub fn undelete_long_task_archive_day(
     state: State<AppState>,
 ) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut tasks = storage.read_long_tasks().map_err(|e| e.to_string())?;
     let idx = tasks
         .iter()
@@ -870,6 +972,7 @@ fn persist_archive(storage: &mut Storage, entry: ArchiveEntry) -> Result<Archive
 #[tauri::command]
 pub fn archive_entry(entry: ArchiveEntry, state: State<AppState>) -> Result<ArchiveEntry, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let saved = persist_archive(&mut storage, entry)?;
     let hooks_enabled = state
         .config
@@ -905,6 +1008,7 @@ pub fn complete_candidate(
     state: State<AppState>,
 ) -> Result<ArchiveEntry, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let now = timeutil::now_utc_string();
     let source = match input.source_type.as_str() {
@@ -980,6 +1084,7 @@ pub fn update_archive_day(
     // BUG-27：校验日期 key，拒绝写入垃圾 day key。
     timeutil::parse_date(&date).map_err(|e| e.to_string())?;
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let month = month_of(&date);
     let mut archive = storage
         .load_archive_month(&month)
@@ -1022,7 +1127,22 @@ pub fn set_config(
     _app: tauri::AppHandle,
     state: State<AppState>,
 ) -> Result<Config, String> {
+    if let Some(error) = state
+        .recovery_error
+        .lock()
+        .map_err(|_| lock_err())?
+        .as_ref()
+    {
+        return Err(format!("需要恢复数据：{error}"));
+    }
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let previous = storage.read_config().map_err(|e| e.to_string())?;
+    if previous.tag_colors != config.tag_colors
+        || previous.candidate.missed_routine_grace_hours
+            != config.candidate.missed_routine_grace_hours
+    {
+        sync_service(&state).prepare_write()?;
+    }
     config.version = schedule_core::CURRENT_VERSION;
     storage.save_config(&config).map_err(|e| e.to_string())?;
     if let Ok(mut cfg) = state.config.lock() {
@@ -1340,26 +1460,13 @@ pub fn rename_tag(old: String, new: String, state: State<AppState>) -> Result<()
         return Err("新标签名不能为空".to_string());
     }
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-    let dir = storage.data_dir().to_path_buf();
-    let snap = snapshot_data_files(&dir)?;
-    match rename_tag_impl(&mut storage, &old, &new) {
-        Ok(color_changed) => {
-            cleanup_snapshot(&snap);
-            if color_changed {
-                let config = storage.read_config().map_err(|e| e.to_string())?;
-                if let Ok(mut cfg) = state.config.lock() {
-                    *cfg = config;
-                }
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let _ = restore_data_files(&snap, &dir);
-            *storage = Storage::new(dir);
-            cleanup_snapshot(&snap);
-            Err(format!("重命名标签失败，已回滚：{e}"))
-        }
+    sync_service(&state).prepare_write()?;
+    let color_changed = crate::sync_snapshot::edit(&mut storage, |staged| rename_tag_impl(staged, &old, &new))?;
+    if color_changed {
+        let config = storage.read_config().map_err(|e| e.to_string())?;
+        if let Ok(mut cfg) = state.config.lock() { *cfg = config; }
     }
+    Ok(())
 }
 
 /// `delete_tag(tag)`：跨事件/日常/浮动/长期任务移除标签；同步删除颜色映射（V3.1 U4）。
@@ -1432,26 +1539,13 @@ fn delete_tag_impl(storage: &mut Storage, tag: &str) -> Result<bool, String> {
 #[tauri::command]
 pub fn delete_tag(tag: String, state: State<AppState>) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-    let dir = storage.data_dir().to_path_buf();
-    let snap = snapshot_data_files(&dir)?;
-    match delete_tag_impl(&mut storage, &tag) {
-        Ok(color_changed) => {
-            cleanup_snapshot(&snap);
-            if color_changed {
-                let config = storage.read_config().map_err(|e| e.to_string())?;
-                if let Ok(mut cfg) = state.config.lock() {
-                    *cfg = config;
-                }
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let _ = restore_data_files(&snap, &dir);
-            *storage = Storage::new(dir);
-            cleanup_snapshot(&snap);
-            Err(format!("删除标签失败，已回滚：{e}"))
-        }
+    sync_service(&state).prepare_write()?;
+    let color_changed = crate::sync_snapshot::edit(&mut storage, |staged| delete_tag_impl(staged, &tag))?;
+    if color_changed {
+        let config = storage.read_config().map_err(|e| e.to_string())?;
+        if let Ok(mut cfg) = state.config.lock() { *cfg = config; }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,74 +1561,9 @@ const DATA_FILES: [&str; 6] = [
     "long_tasks.json",
 ];
 
-/// BUG-04/15/16：多文件写操作的临时快照目录（用于失败回滚）。
-fn snapshot_data_files(src: &Path) -> Result<PathBuf, String> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let snap =
-        std::env::temp_dir().join(format!("schedule-snapshot-{}-{stamp}", std::process::id()));
-    fs::create_dir_all(snap.join("archive")).map_err(|e| e.to_string())?;
-    for f in DATA_FILES {
-        let s = src.join(f);
-        if s.exists() {
-            fs::copy(&s, snap.join(f)).map_err(|e| e.to_string())?;
-        }
-    }
-    let arc = src.join("archive");
-    if arc.exists() {
-        for entry in fs::read_dir(&arc).map_err(|e| e.to_string())? {
-            let p = entry.map_err(|e| e.to_string())?.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                if let Some(name) = p.file_name().and_then(|x| x.to_str()) {
-                    fs::copy(&p, snap.join("archive").join(name)).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
-    Ok(snap)
-}
-
-fn restore_data_files(snap: &Path, dst: &Path) -> Result<(), String> {
-    // 先清除目标数据文件，再整体回滚快照，避免写入过程新增的文件残留。
-    for f in DATA_FILES {
-        let _ = fs::remove_file(dst.join(f));
-    }
-    let arc = dst.join("archive");
-    if arc.exists() {
-        for entry in fs::read_dir(&arc).map_err(|e| e.to_string())? {
-            let p = entry.map_err(|e| e.to_string())?.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                let _ = fs::remove_file(p);
-            }
-        }
-    }
-    fs::create_dir_all(&arc).map_err(|e| e.to_string())?;
-    for f in DATA_FILES {
-        let s = snap.join(f);
-        if s.exists() {
-            fs::copy(&s, dst.join(f)).map_err(|e| e.to_string())?;
-        }
-    }
-    let snap_arc = snap.join("archive");
-    if snap_arc.exists() {
-        for entry in fs::read_dir(&snap_arc).map_err(|e| e.to_string())? {
-            let p = entry.map_err(|e| e.to_string())?.path();
-            if let Some(name) = p.file_name().and_then(|x| x.to_str()) {
-                fs::copy(&p, arc.join(name)).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_snapshot(snap: &Path) {
-    let _ = fs::remove_dir_all(snap);
-}
-
 /// `pick_directory()`：原生文件夹选择（用于导入/导出/自定义数据目录）。
 #[tauri::command]
+#[cfg(desktop)]
 pub fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let picked = app.dialog().file().blocking_pick_folder();
     Ok(picked
@@ -1542,59 +1571,88 @@ pub fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
         .map(|p| p.display().to_string()))
 }
 
+/// 移动端没有桌面文件夹选择器；数据目录由系统应用沙盒管理。
+#[tauri::command]
+#[cfg(mobile)]
+pub fn pick_directory(_app: tauri::AppHandle) -> Result<Option<String>, String> {
+    Err("Android 不支持选择本机数据目录".to_string())
+}
+
 /// `set_data_dir(path)`：切换自定义数据目录（把现有数据迁移过去，写入指针文件）。
 /// `path = "auto"` 时恢复默认用户数据目录。
 #[tauri::command]
 pub fn set_data_dir(path: String, state: State<AppState>) -> Result<Config, String> {
-    let base = state.base_dir.clone();
-    let target = if path == "auto" {
-        base.clone()
-    } else {
-        let p = PathBuf::from(&path);
-        if !p.is_absolute() {
-            return Err("数据目录必须是绝对路径".to_string());
-        }
-        p
-    };
-    let src = {
-        let storage = state.storage.lock().map_err(|_| lock_err())?;
-        storage.data_dir().to_path_buf()
-    };
-    fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-    fs::create_dir_all(target.join("archive")).map_err(|e| e.to_string())?;
-
-    // 目标为空（无 config.json）时才复制现有数据，避免覆盖已有数据。
-    if target != src && !target.join("config.json").exists() {
-        copy_data_files(&src, &target);
-    }
-
-    // 切换存储，并把 dataDir 写入新目录的 config。
-    let mut new_storage = Storage::new(target.clone());
-    new_storage.ensure().map_err(|e| e.to_string())?;
-    let mut config = new_storage.read_config().unwrap_or_default();
-    config.data_dir = path.clone();
-    new_storage
-        .save_config(&config)
-        .map_err(|e| e.to_string())?;
-
+    #[cfg(target_os = "android")]
     {
+        let _ = (path, state);
+        return Err("Android 使用应用沙盒，不支持切换数据目录".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _operation = state
+            .sync_gate
+            .try_lock()
+            .map_err(|_| "同步正在进行，请稍后切换目录".to_string())?;
         let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-        *storage = new_storage;
+        sync_service(&state).prepare_write()?;
+        let base = state.base_dir.clone();
+        let target = if path == "auto" {
+            base.clone()
+        } else {
+            let p = PathBuf::from(&path);
+            if !p.is_absolute() {
+                return Err("数据目录必须是绝对路径".into());
+            }
+            p
+        };
+        let source = storage.data_dir().to_path_buf();
+        let mut next = Storage::new(target.clone());
+        next.ensure().map_err(|e| e.to_string())?;
+        if source != target
+            && target
+                .canonicalize()
+                .map_err(|e| e.to_string())?
+                .starts_with(source.canonicalize().map_err(|e| e.to_string())?)
+        {
+            return Err("新目录不能位于当前数据目录内部".into());
+        }
+        let has_files = DATA_FILES.iter().any(|name| target.join(name).exists())
+            || fs::read_dir(target.join("archive"))
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+        let mut config = if source != target && !has_files {
+            let payload = crate::sync::build_payload(&mut storage)?;
+            let mut config = storage.read_config().map_err(|e| e.to_string())?;
+            config.data_dir = path.clone();
+            crate::sync_snapshot::apply_with_config(&mut next, &payload, Some(config.clone()))?;
+            config
+        } else {
+            crate::sync_snapshot::recover(&target)?;
+            let data = next.load_all().map_err(|e| e.to_string())?;
+            validate_snapshot_data(&data)?;
+            data.config
+        };
+        config.data_dir = path.clone();
+        next.save_config(&config).map_err(|e| e.to_string())?;
+        let pointer = base.join("data_dir.txt");
+        if path == "auto" {
+            match fs::remove_file(&pointer) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(format!("更新数据目录指针失败：{e}")),
+            }
+        } else {
+            crate::sync::atomic_write(&pointer, target.to_string_lossy().as_bytes())?;
+        }
+        *storage = next;
+        if let Ok(mut cached) = state.config.lock() {
+            *cached = config.clone();
+        }
+        state
+            .config_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(config)
     }
-    if let Ok(mut cfg) = state.config.lock() {
-        *cfg = config.clone();
-    }
-    // 数据目录切换后，让移动端服务 / Git 自动提交收敛到新目录。
-    state
-        .config_generation
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    // 指针文件：自定义目录时写入，恢复默认时删除。
-    if path == "auto" {
-        let _ = fs::remove_file(base.join("data_dir.txt"));
-    } else {
-        let _ = fs::write(base.join("data_dir.txt"), path.as_bytes());
-    }
-    Ok(config)
 }
 
 /// `export_data(dest_dir)`：导出全部 JSON 到目标目录（生成 schedule-export 子目录）。
@@ -1644,141 +1702,33 @@ pub struct ImportResult {
 
 #[tauri::command]
 pub fn import_data(src_dir: String, state: State<AppState>) -> Result<ImportResult, String> {
-    let src = PathBuf::from(src_dir);
+    let _operation = state
+        .sync_gate
+        .try_lock()
+        .map_err(|_| "同步正在进行，请稍后导入".to_string())?;
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
-
-    // ---- BUG-04 第一阶段：全量校验源目录（含 templates 与全部 archive 月份）。 ----
-    let mut src_storage = Storage::new(src.clone());
-    let src_data = src_storage.load_all().map_err(|e| e.to_string())?;
-    // BUG-12/22：导入路径同样校验事件区间与全天日期；日常窗口走统一校验。
-    for ev in &src_data.events {
-        if ev.all_day {
-            timeutil::parse_date(&ev.start).map_err(|e| format!("全天事件日期无效：{e}"))?;
-            if let Some(end) = &ev.end {
-                timeutil::parse_date(end).map_err(|e| format!("全天事件日期无效：{e}"))?;
-                if end < &ev.start {
-                    return Err("全天事件结束日期不能早于开始日期".to_string());
-                }
-            }
-        } else {
-            let s = timeutil::parse_utc(&ev.start).map_err(|e| e.to_string())?;
-            if let Some(end) = &ev.end {
-                let e = timeutil::parse_utc(end).map_err(|err| err.to_string())?;
-                if e <= s {
-                    return Err("事件结束时间不能早于或等于开始时间".to_string());
-                }
-            }
-        }
-    }
-    for rt in &src_data.routines {
-        validate_routine(rt)?;
-    }
-    let templates = src_storage.read_templates().map_err(|e| e.to_string())?;
-    let mut src_months = Vec::new();
-    let arc_src = src.join("archive");
-    if arc_src.exists() {
-        for entry in fs::read_dir(&arc_src).map_err(|e| e.to_string())? {
-            let p = entry.map_err(|e| e.to_string())?.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                if let Some(name) = p.file_name().and_then(|x| x.to_str()) {
-                    let month = name.trim_end_matches(".json").to_string();
-                    if !is_valid_month(&month) {
-                        return Err(format!("归档文件名无效：{name}"));
-                    }
-                    src_storage
-                        .load_archive_month(&month)
-                        .map_err(|e| e.to_string())?;
-                    src_months.push(month);
-                }
-            }
-        }
-    }
-
-    // ---- 第二阶段：快照当前数据 → 全量写入；任一失败回滚。 ----
-    let cur_dir = storage.data_dir().to_path_buf();
-    let cur_data_dir = storage
-        .read_config()
-        .map_err(|e| e.to_string())?
-        .data_dir
-        .clone();
-    let mut config = src_data.config.clone();
-    config.data_dir = cur_data_dir;
-    config.version = schedule_core::CURRENT_VERSION;
-
-    let snap = snapshot_data_files(&cur_dir)?;
-    let mut do_import = || -> Result<usize, String> {
-        storage
-            .save_events(&src_data.events)
-            .map_err(|e| e.to_string())?;
-        storage
-            .save_routines(&src_data.routines)
-            .map_err(|e| e.to_string())?;
-        storage
-            .save_tasks(&src_data.tasks)
-            .map_err(|e| e.to_string())?;
-        storage
-            .save_long_tasks(&src_data.long_tasks)
-            .map_err(|e| e.to_string())?;
-        storage
-            .save_templates(&templates)
-            .map_err(|e| e.to_string())?;
-        storage.save_config(&config).map_err(|e| e.to_string())?;
-        let mut months = 0usize;
-        for month in &src_months {
-            let af = src_storage
-                .load_archive_month(month)
-                .map_err(|e| e.to_string())?;
-            storage.save_archive_month(&af).map_err(|e| e.to_string())?;
-            months += 1;
-        }
-        Ok(months)
-    };
-
-    let months = match do_import() {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = restore_data_files(&snap, &cur_dir);
-            *storage = Storage::new(cur_dir);
-            cleanup_snapshot(&snap);
-            return Err(format!("导入失败，已回滚：{e}"));
-        }
-    };
-    cleanup_snapshot(&snap);
-
-    if let Ok(mut cfg) = state.config.lock() {
-        *cfg = config;
+    sync_service(&state).prepare_write()?;
+    let mut source = Storage::new(PathBuf::from(src_dir));
+    let payload = crate::sync::build_payload(&mut source)?;
+    let current_dir = storage.read_config().map_err(|e| e.to_string())?.data_dir;
+    let mut config = source.read_config().map_err(|e| e.to_string())?;
+    config.data_dir = current_dir;
+    crate::sync_snapshot::apply_with_config(&mut storage, &payload, Some(config))?;
+    let imported = storage.load_all().map_err(|e| e.to_string())?;
+    if let Ok(mut cached) = state.config.lock() {
+        *cached = imported.config.clone();
     }
     Ok(ImportResult {
-        events: src_data.events.len(),
-        routines: src_data.routines.len(),
-        tasks: src_data.tasks.len(),
-        long_tasks: src_data.long_tasks.len(),
-        archive_months: months,
+        events: imported.events.len(),
+        routines: imported.routines.len(),
+        tasks: imported.tasks.len(),
+        long_tasks: imported.long_tasks.len(),
+        archive_months: payload
+            .files
+            .keys()
+            .filter(|n| n.starts_with("archive/"))
+            .count(),
     })
-}
-
-/// best-effort 复制数据文件（用于切换自定义目录时迁移）。
-fn copy_data_files(src: &Path, dst: &Path) {
-    for f in DATA_FILES {
-        let s = src.join(f);
-        if s.exists() {
-            let _ = fs::copy(&s, dst.join(f));
-        }
-    }
-    let arc_src = src.join("archive");
-    if arc_src.exists() {
-        let _ = fs::create_dir_all(dst.join("archive"));
-        if let Ok(entries) = fs::read_dir(&arc_src) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("json") {
-                    if let Some(name) = p.file_name().and_then(|x| x.to_str()) {
-                        let _ = fs::copy(&p, dst.join("archive").join(name));
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1809,6 +1759,7 @@ pub fn make_template_default(kind: String) -> Result<Template, String> {
 #[tauri::command]
 pub fn save_template(template: Template, state: State<AppState>) -> Result<Template, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut templates = storage.read_templates().map_err(|e| e.to_string())?;
     let mut t = template;
     if t.id.is_empty() {
@@ -1833,6 +1784,7 @@ pub fn save_template(template: Template, state: State<AppState>) -> Result<Templ
 #[tauri::command]
 pub fn delete_template(id: String, state: State<AppState>) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let mut templates = storage.read_templates().map_err(|e| e.to_string())?;
     let now = timeutil::now_utc_string();
     for t in templates.iter_mut() {
@@ -1872,6 +1824,7 @@ pub fn apply_template_cmd(
     state: State<AppState>,
 ) -> Result<TemplateApplyResult, String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     let config = storage.read_config().map_err(|e| e.to_string())?;
     let templates = storage.read_templates().map_err(|e| e.to_string())?;
     let t = templates
@@ -1880,21 +1833,9 @@ pub fn apply_template_cmd(
         .cloned()
         .ok_or_else(|| "模板不存在".to_string())?;
 
-    // BUG-15：events / routines 两步写入任一失败则回滚，重试不会重复生成。
-    let dir = storage.data_dir().to_path_buf();
-    let snap = snapshot_data_files(&dir)?;
-    match apply_template(&mut storage, &t, &date, &config.timezone) {
-        Ok(r) => {
-            cleanup_snapshot(&snap);
-            Ok(r)
-        }
-        Err(e) => {
-            let _ = restore_data_files(&snap, &dir);
-            *storage = Storage::new(dir);
-            cleanup_snapshot(&snap);
-            Err(format!("应用模板失败，已回滚：{e}"))
-        }
-    }
+    crate::sync_snapshot::edit(&mut storage, |staged| {
+        apply_template(staged, &t, &date, &config.timezone).map_err(|e| e.to_string())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1966,13 +1907,14 @@ pub fn run_hook_test(
 #[tauri::command]
 pub fn resolve_external_change(choice: String, state: State<AppState>) -> Result<(), String> {
     let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    sync_service(&state).prepare_write()?;
     match choice.as_str() {
         "overwrite" => {
             storage.set_force_overwrite(true);
             Ok(())
         }
         "reload" => {
-            storage.set_force_overwrite(false);
+            storage.accept_external_changes();
             Ok(())
         }
         _ => Err("无效的冲突处理选择".to_string()),
@@ -1985,6 +1927,7 @@ pub fn resolve_external_change(choice: String, state: State<AppState>) -> Result
 
 /// `open_data_dir()`：用系统文件管理器打开当前数据目录（V3.0 F6）。
 #[tauri::command]
+#[cfg(not(target_os = "android"))]
 pub fn open_data_dir(state: State<AppState>) -> Result<(), String> {
     let dir = {
         let storage = state.storage.lock().map_err(|_| lock_err())?;
@@ -2011,6 +1954,397 @@ pub fn open_data_dir(state: State<AppState>) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("打开目录失败：{e}"))?;
     }
+    Ok(())
+}
+
+/// Android 数据目录位于应用沙盒内，不提供桌面文件管理器打开操作。
+#[tauri::command]
+#[cfg(target_os = "android")]
+pub fn open_data_dir(_state: State<AppState>) -> Result<(), String> {
+    Err("Android 不支持直接打开应用数据目录".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// V2.0 Lite：七牛单设备互斥快照同步
+// ---------------------------------------------------------------------------
+
+/// System document pickers support Android content:// URIs without storage permissions.
+#[tauri::command]
+pub fn recovery_points(state: State<AppState>) -> Result<Vec<String>, String> {
+    let storage = state.storage.lock().map_err(|_| lock_err())?;
+    crate::sync_snapshot::recovery_points(storage.data_dir())
+}
+#[tauri::command]
+pub fn recovery_details(
+    state: State<AppState>,
+) -> Result<Vec<crate::sync_snapshot::RecoveryDetails>, String> {
+    let storage = state.storage.lock().map_err(|_| lock_err())?;
+    crate::sync_snapshot::recovery_details(storage.data_dir())
+}
+#[tauri::command]
+pub async fn export_sync_diagnostics(app: AppHandle) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Write;
+        let raw = serde_json::to_vec_pretty(&sync_service(&app.state::<AppState>()).diagnostics())
+            .map_err(|e| e.to_string())?;
+        let Some(path) = app
+            .dialog()
+            .file()
+            .set_file_name("moment-diagnostics.json")
+            .add_filter("JSON", &["json"])
+            .blocking_save_file()
+        else {
+            return Ok(false);
+        };
+        let mut options = tauri_plugin_fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        let mut file = app.fs().open(path, options).map_err(|e| e.to_string())?;
+        file.write_all(&raw).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub fn restore_recovery_point(id: String, state: State<AppState>) -> Result<(), String> {
+    let _operation = state
+        .sync_gate
+        .try_lock()
+        .map_err(|_| "同步正在进行，请稍后恢复".to_string())?;
+    let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+    let blocked = state
+        .recovery_error
+        .lock()
+        .map_err(|_| lock_err())?
+        .is_some();
+    if blocked {
+        crate::sync_snapshot::restore_blocked(&mut storage, &id)?;
+    } else {
+        sync_service(&state).prepare_write()?;
+        crate::sync_snapshot::restore_point(&mut storage, &id)?;
+    }
+    *state.recovery_error.lock().map_err(|_| lock_err())? = None;
+    let config = storage.read_config().map_err(|e| e.to_string())?;
+    if let Ok(mut cache) = state.config.lock() {
+        *cache = config;
+    }
+    state.config_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryStatus {
+    error: Option<String>,
+    points: Vec<String>,
+}
+#[tauri::command]
+pub fn recovery_status(state: State<AppState>) -> Result<RecoveryStatus, String> {
+    let storage = state.storage.lock().map_err(|_| lock_err())?;
+    Ok(RecoveryStatus {
+        error: state.recovery_error.lock().map_err(|_| lock_err())?.clone(),
+        points: crate::sync_snapshot::recovery_points(storage.data_dir())?,
+    })
+}
+
+#[tauri::command]
+pub async fn notification_permission(app: AppHandle, request: bool) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let current = app.notification().permission_state().map_err(|e| e.to_string())?;
+        // The Android plugin does not resolve requestPermissions when the
+        // permission is already granted. Checking first also avoids a dialog.
+        let result = if request && current != tauri::plugin::PermissionState::Granted {
+            app.notification().request_permission()
+        } else {
+            Ok(current)
+        }
+        .map_err(|e| e.to_string())?;
+        crate::check_and_notify(&app);
+        Ok(format!("{result:?}").to_lowercase())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn notification_reminder_status(app: AppHandle) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "android")]
+        { crate::mobile_reminders::status(&app).and_then(|s| serde_json::to_value(s).map_err(|e| e.to_string())) }
+        #[cfg(not(target_os = "android"))]
+        { let _ = app; Ok(serde_json::json!({"exact":true})) }
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn notification_open_settings(app: AppHandle, exact: bool) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "android")]
+        { crate::mobile_reminders::open_settings(&app, exact) }
+        #[cfg(not(target_os = "android"))]
+        { let _ = (app, exact); Ok(()) }
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn notification_pending_count(app: AppHandle) -> Result<usize, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        #[cfg(target_os = "android")]
+        {
+            app.notification()
+                .pending()
+                .map(|items| items.len())
+                .map_err(|e| e.to_string())
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = app;
+            Ok(0)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn export_backup_document(
+    app: AppHandle,
+    passphrase: Option<String>,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Write;
+        let state = app.state::<AppState>();
+        let raw = {
+            let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+            let payload = crate::sync::build_payload(&mut storage)?;
+            match passphrase.as_deref().filter(|p| !p.is_empty()) {
+                Some(password) if password.chars().count() < 8 => {
+                    return Err("备份口令至少需要 8 个字符".into())
+                }
+                Some(password) => crate::sync::encrypt(&payload, password)?,
+                None => serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?,
+            }
+        };
+        let name = format!(
+            "moment-backup-{}.json",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        let Some(path) = app
+            .dialog()
+            .file()
+            .set_file_name(name)
+            .add_filter("MOMENT备份", &["json"])
+            .blocking_save_file()
+        else {
+            return Ok(false);
+        };
+        let mut options = tauri_plugin_fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        let mut file = app.fs().open(path, options).map_err(|e| e.to_string())?;
+        file.write_all(&raw).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn import_backup_document(
+    app: AppHandle,
+    passphrase: Option<String>,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+        let Some(path) = app
+            .dialog()
+            .file()
+            .add_filter("MOMENT备份", &["json"])
+            .blocking_pick_file()
+        else {
+            return Ok(false);
+        };
+        let mut options = tauri_plugin_fs::OpenOptions::new();
+        options.read(true);
+        let file = app.fs().open(path, options).map_err(|e| e.to_string())?;
+        let limit = crate::sync_snapshot::MAX_BYTES;
+        let mut raw = Vec::new();
+        file.take(limit as u64 + 1)
+            .read_to_end(&mut raw)
+            .map_err(|e| e.to_string())?;
+        if raw.len() > limit {
+            return Err("备份文件过大".into());
+        }
+        let json: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|_| "备份格式无效，请选择 MOMENT 日程备份 JSON".to_string())?;
+        let payload: crate::sync::SnapshotPayload = if json.get("format").is_some() {
+            crate::sync::decrypt(
+                &raw,
+                passphrase
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .ok_or("此备份已加密，请先填写备份口令")?,
+            )?
+        } else {
+            serde_json::from_value(json).map_err(|_| "备份格式无效".to_string())?
+        };
+        let state = app.state::<AppState>();
+        let _operation = state.sync_gate.lock().map_err(|_| lock_err())?;
+        let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+        let blocked = state.recovery_error.lock().map_err(|_| lock_err())?.is_some();
+        if blocked {
+            let config = storage.read_config().unwrap_or_else(|_| state.config.lock().map(|c| c.clone()).unwrap_or_default());
+            crate::sync_snapshot::restore_payload_blocked(&mut storage, &payload, config)?;
+            *state.recovery_error.lock().map_err(|_| lock_err())? = None;
+        } else {
+            sync_service(&state).prepare_write()?;
+            crate::sync_snapshot::apply(&mut storage, &payload)?;
+        }
+        let config = storage.read_config().map_err(|e| e.to_string())?;
+        *state.config.lock().map_err(|_| lock_err())? = config;
+        state.config_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn sync_get_status(state: State<AppState>) -> Result<SyncStatus, String> {
+    Ok(sync_service(&state).status())
+}
+
+async fn run_sync(
+    app: AppHandle,
+    work: impl FnOnce(SyncService, &std::sync::Mutex<Storage>) -> Result<SyncStatus, String>
+        + Send
+        + 'static,
+) -> Result<SyncStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _operation = state
+            .sync_gate
+            .try_lock()
+            .map_err(|_| "同步正在进行，请稍后重试".to_string())?;
+        state
+            .sync_control
+            .cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        state
+            .sync_control
+            .busy
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let service = sync_service(&state);
+        let _network_scope=crate::sync::network_scope(state.sync_control.clone());
+        let _ = app.emit("sync-status-changed", service.status());
+        let result = work(sync_service(&state), &state.storage);
+        state.sync_control.completed(result.is_ok());
+        let mut storage = state.storage.lock().map_err(|_| lock_err())?;
+        if let Err(error) = &result {
+            service.record_error(error);
+        }
+        if state
+            .recovery_error
+            .lock()
+            .map_err(|_| lock_err())?
+            .is_none()
+        {
+            if let Ok(config) = storage.read_config() {
+                if let Ok(mut cache) = state.config.lock() {
+                    *cache = config;
+                }
+            }
+        }
+        let _ = app.emit("sync-status-changed", service.status());
+        result.map(|_| service.status())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn sync_configure(input: SyncConfigInput, app: AppHandle) -> Result<SyncStatus, String> {
+    run_sync(app, move |s, storage| {
+        let _local = storage.lock().map_err(|_| lock_err())?;
+        s.configure(input)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn sync_test_connection(app: AppHandle) -> Result<SyncStatus, String> {
+    run_sync(app, |s, _| s.test_connection()).await
+}
+#[tauri::command]
+pub async fn sync_now(app: AppHandle) -> Result<SyncStatus, String> {
+    run_sync(app, |s, storage| s.sync(storage, false)).await
+}
+#[tauri::command]
+pub async fn sync_tick(app: AppHandle) -> Result<SyncStatus, String> {
+    {
+        let state = app.state::<AppState>();
+        if state
+            .sync_control
+            .busy
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || !state.sync_control.retry_due()
+        {
+            return Ok(sync_service(&state).status());
+        }
+    }
+    run_sync(app, |s, storage| s.tick(storage)).await
+}
+#[tauri::command]
+pub fn sync_cancel(app: AppHandle) -> Result<SyncStatus, String> {
+    let state = app.state::<AppState>();
+    if state
+        .sync_control
+        .busy
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        state
+            .sync_control
+            .cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(sync_service(&state).status())
+}
+#[tauri::command]
+pub async fn sync_resolve_initial(
+    input: InitialSyncChoiceInput,
+    app: AppHandle,
+) -> Result<SyncStatus, String> {
+    run_sync(app, move |s, storage| s.resolve_initial(storage, input)).await
+}
+#[tauri::command]
+pub async fn sync_takeover_expired(app: AppHandle) -> Result<SyncStatus, String> {
+    run_sync(app, |s, storage| s.sync(storage, true)).await
+}
+#[tauri::command]
+pub async fn sync_disconnect(app: AppHandle) -> Result<(), String> {
+    run_sync(app, |s, storage| {
+        s.disconnect(storage)?;
+        Ok(s.status())
+    })
+    .await
+    .map(|_| ())
+}
+#[tauri::command]
+pub async fn sync_exit(app: AppHandle) -> Result<(), String> {
+    run_sync(app.clone(), |s, storage| {
+        if s.status().configured {
+            s.sync(storage, false)?;
+            s.release(storage)?;
+        }
+        Ok(s.status())
+    })
+    .await?;
+    app.exit(0);
+    Ok(())
+}
+#[tauri::command]
+pub async fn sync_force_exit(app: AppHandle) -> Result<(), String> {
+    // Do not release a lease while local edits remain unuploaded. Its expiry
+    // protects the pending local copy until the user explicitly takes over.
+    app.exit(0);
     Ok(())
 }
 
@@ -2321,18 +2655,8 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_and_restore_data_files() {
-        let dir = tmp_dir("snapshot-rollback");
-        fs::write(dir.join("events.json"), "A").unwrap();
-        let snap = snapshot_data_files(&dir).unwrap();
-        fs::write(dir.join("events.json"), "B").unwrap();
-        restore_data_files(&snap, &dir).unwrap();
-        assert_eq!(fs::read_to_string(dir.join("events.json")).unwrap(), "A");
-        cleanup_snapshot(&snap);
-    }
-
-    #[test]
-    fn test_cross_midnight_routine_window_is_accepted() {        let mut r = Routine {
+    fn test_cross_midnight_routine_window_is_accepted() {
+        let mut r = Routine {
             id: "r1".to_string(),
             title: "r".to_string(),
             description: None,

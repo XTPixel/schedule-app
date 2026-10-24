@@ -33,7 +33,14 @@ pub fn ensure_single_instance() -> bool {
         FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
     };
 
-    let mutex_name = wide(SINGLE_INSTANCE_MUTEX);
+    let mut name=SINGLE_INSTANCE_MUTEX.to_string();
+    #[cfg(debug_assertions)]
+    if let Some(path)=std::env::var_os("MOMENT_QA_DATA_DIR") {
+        use std::hash::{Hash,Hasher};
+        let mut hash=std::collections::hash_map::DefaultHasher::new();path.hash(&mut hash);
+        name=format!("{name}.qa-{}",hash.finish());
+    }
+    let mutex_name = wide(&name);
     // 初始持有者置 true 并无必要，关键是句柄在整个主实例生命周期内保持打开。
     let handle = match unsafe { CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr())) } {
         Ok(h) => h,

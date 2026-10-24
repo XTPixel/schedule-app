@@ -1,4 +1,6 @@
 node_modules/
+.build-cache/
+.private/
 dist/
 src-tauri/target/
 src-tauri/core/target/
@@ -6,4 +8,12 @@ src-tauri/core/target/
 .rustup/
 .cargo/
 .tools/*.exe
+/android-*.png
 docs/
+!docs/
+docs/*
+!docs/多设备同步更新计划.md
+!docs/V2.0_Lite_完整开发与验收计划.md
+!docs/V2.0_Lite_开发与模拟器验收记录.md
+!docs/V2.0_Lite_beta2_验收与交付记录.md
+!docs/V2.0_Lite_rc1_验收与发布说明.md

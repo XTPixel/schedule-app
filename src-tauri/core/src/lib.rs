@@ -21,6 +21,7 @@ pub mod id;
 pub mod models;
 pub mod nlp;
 pub mod recurrence;
+pub mod reminder_plan;
 pub mod routines;
 pub mod search;
 pub mod stats;
@@ -29,19 +30,19 @@ pub mod template;
 pub mod timeutil;
 
 pub use candidates::{compute_candidates, Candidate, CandidatesResult, ReminderNotice, Timeline};
-pub use hooks::{dispatch as dispatch_hook, list_hooks, HookInfo, HookRunResult};
-pub use template::{
-    apply_template, new_template, new_template_item, preview_template, TemplateApplyResult,
-    TemplatePreview,
-};
 pub use error::{AppError, AppResult};
+pub use hooks::{dispatch as dispatch_hook, list_hooks, HookInfo, HookRunResult};
 pub use models::*;
 pub use nlp::{parse_natural_language, NlpEvent};
 pub use recurrence::{expand_events, CalendarData, CalendarRoutineWindow, Occurrence};
 pub use routines::time_window_matches_date;
 pub use search::{search, SearchQuery, SearchResult};
 pub use stats::{
-    compute_review, compute_stats, DayCount, ReviewDay, ReviewResult, RoutineCompletion, StatsResult,
-    StatsTotals, TagDuration,
+    compute_review, compute_stats, DayCount, ReviewDay, ReviewResult, RoutineCompletion,
+    StatsResult, StatsTotals, TagDuration,
 };
 pub use storage::{MtimeStatus, Storage};
+pub use template::{
+    apply_template, new_template, new_template_item, preview_template, TemplateApplyResult,
+    TemplatePreview,
+};
