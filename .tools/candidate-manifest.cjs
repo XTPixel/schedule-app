@@ -47,6 +47,7 @@ const verification={
  windows:evidence('.build-cache/windows-evidence/smoke-results.json'),
  windowsUi:evidence('.build-cache/windows-evidence/ui-results.json'),
  windowsFollowupUi:evidence('.build-cache/windows-evidence/followup-ui-results.json'),
+ windowsLifecycle:evidence('.build-cache/windows-lifecycle/latest.json'),
  emulator:evidence('.build-cache/android-evidence/smoke-results.json',{api:36}),
  recovery:evidence('.build-cache/android-evidence/recovery-checks.json',{api:36}),
  androidNotifications:evidence('.build-cache/android-evidence/notification-results.json'),

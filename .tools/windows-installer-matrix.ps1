@@ -158,6 +158,6 @@ try {
 } catch {$momentChecks.Add(@{name='installer matrix';passed=$false;error=$_.Exception.Message});throw}
 finally {
     foreach($momentFact in @($momentFailure,$momentCandidate,$momentLower)){if(Test-MomentInstalled $momentFact.ProductCode){Invoke-MomentInstaller '/x' $momentFact.ProductCode ('cleanup-'+$momentFact.ProductVersion) | Out-Null}}
-    @{recordedAt=[DateTime]::UtcNow.ToString('o');executed=$true;os=[Environment]::OSVersion.VersionString;candidateSha256=$momentCandidate.sha256;results=@($momentChecks)} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $momentMatrixRoot 'installation-results.json') -Encoding utf8
+    @{recordedAt=[DateTime]::UtcNow.ToString('o');executed=$true;os=[Environment]::OSVersion.VersionString;sourceCommit=$env:GITHUB_SHA;candidateSha256=$momentCandidate.sha256;results=@($momentChecks)} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $momentMatrixRoot 'installation-results.json') -Encoding utf8
     Close-MomentCom $momentInstaller
 }

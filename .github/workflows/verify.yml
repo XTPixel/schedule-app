@@ -51,5 +51,9 @@ jobs:
             .build-cache/windows-installer-matrix/*.json
             .build-cache/windows-installer-matrix/*.log
             .build-cache/windows-installer-evidence/*.json
+            .build-cache/verification/summary.json
+            .build-cache/verification/*.log
+            ${{ env.CARGO_TARGET_DIR }}/release/bundle/msi/*.msi
+            ${{ env.CARGO_TARGET_DIR }}/release/schedule-app.exe
           if-no-files-found: warn
           retention-days: 14
