@@ -1,11 +1,12 @@
-# Microsoft documents this per-executable WebView2 policy as an alternative to
-# the environment variable: https://learn.microsoft.com/microsoft-edge/webview2/how-to/debug-visual-studio-code
+# Elevated runners with WebView2 >=150 ignore environment/HKCU flag overrides.
+# Use a temporary per-executable HKLM override only on the disposable CI host:
+# https://learn.microsoft.com/microsoft-edge/webview2/concepts/security
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'build-env.ps1')
 if($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows' -or $env:MOMENT_ALLOW_INSTALLER_QA -ne '1' -or [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE) -ne $momentProjectRoot){throw 'Runtime inspection is restricted to the disposable CI runner'}
 $momentRuntimeOut=Join-Path $momentCacheRoot 'windows-installer-evidence'
 New-Item -ItemType Directory -Force -Path $momentRuntimeOut | Out-Null
-$momentPolicyBase='HKCU:\Software\Policies\Microsoft\Edge\WebView2'
+$momentPolicyBase='HKLM:\Software\Policies\Microsoft\Edge\WebView2'
 $momentPolicies=@{
     AdditionalBrowserArguments=('--remote-debugging-port=9225 --enable-logging --log-file="'+(Join-Path $momentRuntimeOut 'webview-runtime.log')+'"')
     UserDataFolder=(Join-Path $momentRuntimeOut 'release-webview')
